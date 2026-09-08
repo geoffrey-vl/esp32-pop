@@ -13,7 +13,7 @@ If you are looking for code to drive LCDs in general, rather than code that uses
 
 ### Hardware Required
 
-* An ESP development board, with SPI LCD
+* An ESP development board with an ILI9341 SPI LCD
 
 **Connection** :
 
@@ -34,8 +34,6 @@ See the [Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/l
 On ESP-WROVER-KIT there will be:
 
 ```
-LCD ID: 00000000
-ILI9341 detected.
 LCD ILI9341 initialization.
 ```
 

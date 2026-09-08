@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -23,7 +22,7 @@
  This example demonstrates the use of both spi_device_transmit as well as
  spi_device_queue_trans/spi_device_get_trans_result and pre-transmit callbacks.
 
- Some info about the ILI9341/ST7789V: It has an C/D line, which is connected to a GPIO here. It expects this
+ Some info about the ILI9341: It has a C/D line, which is connected to a GPIO here. It expects this
  line to be low for a command and high for data. We use a pre-transmit callback here to control that
  line: every transaction has as the user-definable argument the needed state of the D/C line and just
  before the transaction is sent, the callback will set this line to the correct state.
@@ -58,47 +57,7 @@ typedef struct {
     uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
 } lcd_init_cmd_t;
 
-typedef enum {
-    LCD_TYPE_ILI = 1,
-    LCD_TYPE_ST,
-    LCD_TYPE_MAX,
-} type_lcd_t;
-
 //Place data into DRAM. Constant data gets placed into DROM by default, which is not accessible by DMA.
-DRAM_ATTR static const lcd_init_cmd_t st_init_cmds[] = {
-    /* Memory Data Access Control, MX=MV=1, MY=ML=MH=0, RGB=0 */
-    {0x36, {(1 << 5) | (1 << 6)}, 1},
-    /* Interface Pixel Format, 16bits/pixel for RGB/MCU interface */
-    {0x3A, {0x55}, 1},
-    /* Porch Setting */
-    {0xB2, {0x0c, 0x0c, 0x00, 0x33, 0x33}, 5},
-    /* Gate Control, Vgh=13.65V, Vgl=-10.43V */
-    {0xB7, {0x45}, 1},
-    /* VCOM Setting, VCOM=1.175V */
-    {0xBB, {0x2B}, 1},
-    /* LCM Control, XOR: BGR, MX, MH */
-    {0xC0, {0x2C}, 1},
-    /* VDV and VRH Command Enable, enable=1 */
-    {0xC2, {0x01, 0xff}, 2},
-    /* VRH Set, Vap=4.4+... */
-    {0xC3, {0x11}, 1},
-    /* VDV Set, VDV=0 */
-    {0xC4, {0x20}, 1},
-    /* Frame Rate Control, 60Hz, inversion=0 */
-    {0xC6, {0x0f}, 1},
-    /* Power Control 1, AVDD=6.8V, AVCL=-4.8V, VDDS=2.3V */
-    {0xD0, {0xA4, 0xA1}, 2},
-    /* Positive Voltage Gamma Control */
-    {0xE0, {0xD0, 0x00, 0x05, 0x0E, 0x15, 0x0D, 0x37, 0x43, 0x47, 0x09, 0x15, 0x12, 0x16, 0x19}, 14},
-    /* Negative Voltage Gamma Control */
-    {0xE1, {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D, 0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19}, 14},
-    /* Sleep Out */
-    {0x11, {0}, 0x80},
-    /* Display On */
-    {0x29, {0}, 0x80},
-    {0, {0}, 0xff}
-};
-
 DRAM_ATTR static const lcd_init_cmd_t ili_init_cmds[] = {
     /* Power control B, power control = 0, DC_ENA = 1 */
     {0xCF, {0x00, 0x83, 0X30}, 3},
@@ -166,7 +125,7 @@ DRAM_ATTR static const lcd_init_cmd_t ili_init_cmds[] = {
  * mode for higher speed. The overhead of interrupt transactions is more than
  * just waiting for the transaction to complete.
  */
-void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd, bool keep_cs_active)
+void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd)
 {
     esp_err_t ret;
     spi_transaction_t t;
@@ -174,9 +133,6 @@ void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd, bool keep_cs_active)
     t.length = 8;                   //Command is 8 bits
     t.tx_buffer = &cmd;             //The data is the cmd itself
     t.user = (void*)0;              //D/C needs to be set to 0
-    if (keep_cs_active) {
-        t.flags = SPI_TRANS_CS_KEEP_ACTIVE;   //Keep CS active after data transfer
-    }
     ret = spi_device_polling_transmit(spi, &t); //Transmit!
     assert(ret == ESP_OK);          //Should have had no issues.
 }
@@ -211,34 +167,11 @@ void lcd_spi_pre_transfer_callback(spi_transaction_t *t)
     gpio_set_level(PIN_NUM_DC, dc);
 }
 
-uint32_t lcd_get_id(spi_device_handle_t spi)
-{
-    // When using SPI_TRANS_CS_KEEP_ACTIVE, bus must be locked/acquired
-    spi_device_acquire_bus(spi, portMAX_DELAY);
-
-    //get_id cmd
-    lcd_cmd(spi, 0x04, true);
-
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8 * 3;
-    t.flags = SPI_TRANS_USE_RXDATA;
-    t.user = (void*)1;
-
-    esp_err_t ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
-
-    // Release bus
-    spi_device_release_bus(spi);
-
-    return *(uint32_t*)t.rx_data;
-}
-
 //Initialize the display
 void lcd_init(spi_device_handle_t spi)
 {
     int cmd = 0;
-    const lcd_init_cmd_t* lcd_init_cmds;
+    const lcd_init_cmd_t* lcd_init_cmds = ili_init_cmds;
 
     //Initialize non-SPI GPIOs
     gpio_config_t io_conf = {};
@@ -253,42 +186,11 @@ void lcd_init(spi_device_handle_t spi)
     gpio_set_level(PIN_NUM_RST, 1);
     vTaskDelay(100 / portTICK_PERIOD_MS);
 
-    //detect LCD type
-    uint32_t lcd_id = lcd_get_id(spi);
-    int lcd_detected_type = 0;
-    int lcd_type;
-
-    printf("LCD ID: %08"PRIx32"\n", lcd_id);
-    if (lcd_id == 0) {
-        //zero, ili
-        lcd_detected_type = LCD_TYPE_ILI;
-        printf("ILI9341 detected.\n");
-    } else {
-        // none-zero, ST
-        lcd_detected_type = LCD_TYPE_ST;
-        printf("ST7789V detected.\n");
-    }
-
-#ifdef CONFIG_LCD_TYPE_AUTO
-    lcd_type = lcd_detected_type;
-#elif defined( CONFIG_LCD_TYPE_ST7789V )
-    printf("kconfig: force CONFIG_LCD_TYPE_ST7789V.\n");
-    lcd_type = LCD_TYPE_ST;
-#elif defined( CONFIG_LCD_TYPE_ILI9341 )
-    printf("kconfig: force CONFIG_LCD_TYPE_ILI9341.\n");
-    lcd_type = LCD_TYPE_ILI;
-#endif
-    if (lcd_type == LCD_TYPE_ST) {
-        printf("LCD ST7789V initialization.\n");
-        lcd_init_cmds = st_init_cmds;
-    } else {
-        printf("LCD ILI9341 initialization.\n");
-        lcd_init_cmds = ili_init_cmds;
-    }
+    printf("LCD ILI9341 initialization.\n");
 
     //Send all the commands
     while (lcd_init_cmds[cmd].databytes != 0xff) {
-        lcd_cmd(spi, lcd_init_cmds[cmd].cmd, false);
+        lcd_cmd(spi, lcd_init_cmds[cmd].cmd);
         lcd_data(spi, lcd_init_cmds[cmd].data, lcd_init_cmds[cmd].databytes & 0x1F);
         if (lcd_init_cmds[cmd].databytes & 0x80) {
             vTaskDelay(100 / portTICK_PERIOD_MS);
