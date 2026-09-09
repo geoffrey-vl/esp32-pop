@@ -1,5 +1,4 @@
-set(srcs "pretty_effect.c"
-    "spi_master_example_main.c"
+set(srcs "spi_master_example_main.c"
     "decode_image.c"
     )
 

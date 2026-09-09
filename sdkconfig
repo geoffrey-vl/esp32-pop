@@ -733,12 +733,6 @@ CONFIG_PARTITION_TABLE_MD5=y
 # Example Configuration
 #
 # default:
-CONFIG_LCD_TYPE_AUTO=y
-# default:
-# CONFIG_LCD_TYPE_ST7789V is not set
-# default:
-# CONFIG_LCD_TYPE_ILI9341 is not set
-# default:
 # CONFIG_LCD_OVERCLOCK is not set
 # end of Example Configuration
 
