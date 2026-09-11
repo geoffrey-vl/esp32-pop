@@ -1,0 +1,4 @@
+# Project defaults applied when sdkconfig is (re)generated.
+# The dev board has a 4 MB flash chip.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
