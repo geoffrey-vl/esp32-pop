@@ -16,6 +16,8 @@
 #include "driver/gpio.h"
 
 #include "decode_image.h"
+#include "dat_file.h"
+#include "dat_registry.h"
 
 /*
  This code displays some fancy graphics on the 320x240 LCD on an ESP-WROVER_KIT board.
@@ -316,6 +318,15 @@ void app_main(void)
 {
     esp_err_t ret;
     spi_device_handle_t spi;
+
+    //Parse every embedded DAT file and log its classified resources.
+    for (size_t i = 0; i < g_embedded_dats_count; i++) {
+        dat_file_t dat;
+        if (parse_dat_file(g_embedded_dats[i].name, &dat) == ESP_OK) {
+            free_dat_file(&dat);
+        }
+    }
+
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
         .mosi_io_num = PIN_NUM_MOSI,

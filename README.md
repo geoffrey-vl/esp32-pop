@@ -42,3 +42,35 @@ At the meantime `ESP32` will be displayed on the connected LCD screen.
 ## Troubleshooting
 
 For any technical queries, please open an [issue] (https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
+
+## License
+
+This project is distributed under the **GNU General Public License, version 2**
+(see [LICENSE](LICENSE)).
+
+The reason is that it reuses source code from the
+[Princed Resources](http://forum.princed.org) project (the *Prince of Persia*
+DAT format library), which is licensed under GPLv2. Because the firmware links
+against that GPLv2 code, the combined work is also GPLv2.
+
+### Reused third-party code and modifications
+
+The `main/prince_dat` directory contains files taken from Princed
+Resources:
+
+* `src/dat.c`, `src/autodetect.c`, `src/auxiliary.c` and the headers under
+  `include/` are copied **verbatim** (their original GPL copyright notices are
+  retained).
+* Modifications made for this port, as required by the GPL:
+  * `include/dat.h` — the `PR_DAT_INCLUDE_DATWRITE` define is commented out so
+    that only the read path is compiled.
+  * `src/pr_disk_shim.c` — **new** file. It replaces the original disk I/O
+    loader (`disk.c`'s `mLoadFileArray`) with an in-memory loader that returns
+    the DAT bytes embedded into the firmware, looked up by name through the
+    generated registry (`dat_registry.h`/`dat_registry.c`), so the DAT reader
+    runs unchanged on the ESP32.
+
+The `main/data/*.DAT` resources are *Prince of Persia* data files; they are all
+embedded into the firmware and, at start-up, each one is parsed and classified
+by `parse_dat_file()` (see `main/dat_file.c`), which logs every resource it
+finds over the serial monitor.
