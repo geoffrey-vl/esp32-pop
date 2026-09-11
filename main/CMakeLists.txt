@@ -1,10 +1,12 @@
 set(srcs "spi_master_example_main.c"
-    "decode_image.c"
     "dat_file.c"
+    "dat_image.c"
     "prince_dat/src/dat.c"
     "prince_dat/src/autodetect.c"
     "prince_dat/src/auxiliary.c"
     "prince_dat/src/pr_disk_shim.c"
+    "prince_dat/src/rle_uncompress.c"
+    "prince_dat/src/lzg_uncompress.c"
     )
 
 # Collect every Prince of Persia DAT file to embed into the firmware.
@@ -31,4 +33,4 @@ file(WRITE "${dat_registry_src}" "${dat_registry_body}\n${dat_registry_table}")
 idf_component_register(SRCS ${srcs} "${dat_registry_src}"
                     INCLUDE_DIRS "." "prince_dat/include"
                     PRIV_REQUIRES esp_driver_spi esp_driver_gpio
-                    EMBED_FILES image.jpg ${dat_files})
+                    EMBED_FILES ${dat_files})

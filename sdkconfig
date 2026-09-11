@@ -1973,13 +1973,6 @@ CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y
 # default:
 CONFIG_SPI_FLASH_ENABLE_ENCRYPTED_READ_WRITE=y
 # end of SPI Flash driver
-
-#
-# JPEG Decoder
-#
-# default:
-CONFIG_JD_USE_ROM=y
-# end of JPEG Decoder
 # end of Component config
 
 # default:

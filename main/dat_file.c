@@ -10,6 +10,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -139,3 +140,198 @@ void free_dat_file(dat_file_t *out)
     out->version = 0;
     out->name = NULL;
 }
+
+esp_err_t read_dat_resource(const char *name, int16_t id,
+                            uint8_t **out_data, size_t *out_size)
+{
+    if (name == NULL || out_data == NULL || out_size == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_data = NULL;
+    *out_size = 0;
+
+    unsigned short int numberOfItems = 0;
+    if (mReadBeginDatFile(&numberOfItems, name) != PR_RESULT_SUCCESS) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+
+    for (int k = 0; k < (int)numberOfItems; k++) {
+        tResource res;
+        memset(&res, 0, sizeof(res));
+        res.content.data = NULL;
+        res.content.size = 0;
+
+        mReadFileInDatFile(&res, k);
+
+        if (res.content.data == NULL) {
+            continue;
+        }
+
+        if ((int16_t)res.id.value == id) {
+            uint8_t *copy = malloc((size_t)res.content.size);
+            if (copy != NULL) {
+                memcpy(copy, res.content.data, (size_t)res.content.size);
+                *out_data = copy;
+                *out_size = (size_t)res.content.size;
+                result = ESP_OK;
+            } else {
+                result = ESP_ERR_NO_MEM;
+            }
+            free(res.content.data);
+            break;
+        }
+
+        free(res.content.data);
+    }
+
+    mReadCloseDatFile();
+    return result;
+}
+
+/* Detect a POP1 4-bit palette from the resource content (checksum already
+   stripped by the reader): 100 bytes, and the "16 colors" marker at content[3].
+   Mirrors Princed Resources' verifyPaletteHeaderPop1 (which sees the extra
+   checksum byte, so its offsets are one higher). */
+static bool is_pop1_palette(const tResource *res)
+{
+    const tBinary *c = &res->content;
+    return c->data != NULL && c->size == 100 &&
+           c->data[1] == 0 && c->data[2] == 0 && c->data[3] == 0x10;
+}
+
+/*
+ * Image -> palette association for the stock Prince of Persia 1 (PC) DAT files.
+ *
+ * This mapping is NOT stored in the DAT files themselves; in Princed Resources
+ * it lives in external metadata (resources.xml, via folder inheritance), so it
+ * cannot be recovered from the DAT alone. The table below is derived from that
+ * metadata: each DAT has a default palette plus a few id-range overrides. A
+ * palette id of 0 means "no 4-bit VGA palette" (monochrome / CGA / EGA / sound
+ * / level resources), for which the caller should keep its fallback palette.
+ *
+ * Resource ids are unique only within a single DAT (they overlap across DATs),
+ * so the lookup is keyed by both DAT filename and image id.
+ */
+typedef struct {
+    int16_t lo, hi; /* inclusive image-id range */
+    int16_t pal;    /* palette id for this range (0 = none) */
+} pal_range_t;
+
+typedef struct {
+    const char        *dat;         /* DAT filename (matched case-insensitively) */
+    int16_t            default_pal; /* palette for ids not covered by an override */
+    const pal_range_t *overrides;
+    int                n_overrides;
+} dat_pal_map_t;
+
+static const pal_range_t title_ov[]  = {{41, 41, 40}, {42, 45, 0}};
+static const pal_range_t prince_ov[] = {{1, 2, 150}, {151, 165, 150}, {166, 173, 0}};
+static const pal_range_t pv_ov[]     = {{801, 817, 800}, {901, 930, 900}, {951, 962, 950}, {981, 981, 980}};
+static const pal_range_t vdun_ov[]   = {{268, 268, 0}, {361, 377, 360}, {1314, 1323, 0}};
+static const pal_range_t vpal_ov[]   = {{268, 268, 0}, {361, 365, 360}, {366, 374, 0}, {375, 377, 360}, {1314, 1323, 0}};
+
+static const dat_pal_map_t pal_maps[] = {
+    {"TITLE.DAT",    50, title_ov,  2},
+    {"PRINCE.DAT",  700, prince_ov, 3},
+    {"PV.DAT",      850, pv_ov,     4},
+    {"KID.DAT",     400, NULL,      0},
+    {"FAT.DAT",     750, NULL,      0},
+    {"SHADOW.DAT",  750, NULL,      0},
+    {"SKEL.DAT",    750, NULL,      0},
+    {"VIZIER.DAT",  750, NULL,      0},
+    {"VDUNGEON.DAT", 200, vdun_ov,  3},
+    {"VPALACE.DAT",  200, vpal_ov,  5},
+};
+
+/* Resolve the palette id for (dat, image_id) from the embedded POP1 map.
+   Returns the palette id (>0), 0 if the image has no VGA palette, or -1 if the
+   DAT is not in the table (caller should fall back to auto-detection). */
+static int lookup_pop1_palette_id(const char *name, int16_t image_id)
+{
+    for (size_t i = 0; i < sizeof(pal_maps) / sizeof(pal_maps[0]); i++) {
+        if (strcasecmp(name, pal_maps[i].dat) != 0) {
+            continue;
+        }
+        for (int j = 0; j < pal_maps[i].n_overrides; j++) {
+            const pal_range_t *r = &pal_maps[i].overrides[j];
+            if (image_id >= r->lo && image_id <= r->hi) {
+                return r->pal;
+            }
+        }
+        return pal_maps[i].default_pal;
+    }
+    return -1; /* unknown DAT */
+}
+
+/* Auto-detect palettes in an unknown DAT and pick the largest palette id that
+   is <= image_id, falling back to the lowest palette id. Returns the id, or -1
+   if the DAT contains no POP1 4-bit palette. */
+static int autodetect_palette_id(const char *name, int16_t image_id)
+{
+    unsigned short int numberOfItems = 0;
+    if (mReadBeginDatFile(&numberOfItems, name) != PR_RESULT_SUCCESS) {
+        return -1;
+    }
+
+    int best_below = -1; /* largest palette id <= image_id */
+    int lowest_any = -1; /* smallest palette id overall (fallback) */
+
+    for (int k = 0; k < (int)numberOfItems; k++) {
+        tResource res;
+        memset(&res, 0, sizeof(res));
+        res.content.data = NULL;
+        res.content.size = 0;
+
+        mReadFileInDatFile(&res, k);
+        if (res.content.data == NULL) {
+            continue;
+        }
+        if (is_pop1_palette(&res)) {
+            int pid = (int)(int16_t)res.id.value;
+            if (lowest_any < 0 || pid < lowest_any) {
+                lowest_any = pid;
+            }
+            if (pid <= image_id && pid > best_below) {
+                best_below = pid;
+            }
+        }
+        free(res.content.data);
+    }
+
+    mReadCloseDatFile();
+    return (best_below >= 0) ? best_below : lowest_any;
+}
+
+esp_err_t read_dat_palette_for(const char *name, int16_t image_id,
+                               uint8_t **out_data, size_t *out_size,
+                               int16_t *out_pal_id)
+{
+    if (name == NULL || out_data == NULL || out_size == NULL || out_pal_id == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_data = NULL;
+    *out_size = 0;
+    *out_pal_id = -1;
+
+    /* Prefer the authoritative POP1 mapping; fall back to auto-detection for
+       DATs that are not in the table (e.g. mods or custom files). */
+    int chosen = lookup_pop1_palette_id(name, image_id);
+    if (chosen == 0) {
+        /* Known image with no VGA palette: caller keeps its fallback palette. */
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (chosen < 0) {
+        chosen = autodetect_palette_id(name, image_id);
+        if (chosen < 0) {
+            return ESP_ERR_NOT_FOUND; /* no palette available at all */
+        }
+    }
+
+    *out_pal_id = (int16_t)chosen;
+    return read_dat_resource(name, (int16_t)chosen, out_data, out_size);
+}
+

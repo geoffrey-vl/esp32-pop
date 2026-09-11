@@ -12,12 +12,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 
-#include "decode_image.h"
 #include "dat_file.h"
-#include "dat_registry.h"
+#include "dat_image.h"
 
 /*
  This code displays some fancy graphics on the 320x240 LCD on an ESP-WROVER_KIT board.
@@ -49,6 +50,15 @@
 //To speed up transfers, every SPI transfer sends a bunch of lines. This define specifies how many. More means more memory use,
 //but less overhead for setting up / finishing transfers. Make sure 240 is dividable by this.
 #define PARALLEL_LINES 16
+
+//Panel geometry.
+#define LCD_WIDTH  320
+#define LCD_HEIGHT 240
+
+//DAT file / resource to show on the display. The palette is discovered
+//automatically from the DAT, so it does not need to be configured here.
+#define TITLE_DAT_NAME    "TITLE.DAT"
+#define TITLE_IMAGE_ID    51
 
 /*
  The LCD needs a bunch of command/argument values to be initialized. They are stored in this struct.
@@ -277,10 +287,13 @@ static void send_line_finish(spi_device_handle_t spi)
     }
 }
 
-//Decode and send the embedded image to the LCD.
-static void display_image(spi_device_handle_t spi)
+//Stream a decoded image to the LCD top-left, padding the rest of the 320x240
+//screen with black. Rows are converted from the compact 4-bit indexed image to
+//RGB565 on the fly (dat_image_render_row), so no full-screen framebuffer and no
+//large RGB565 image buffer are needed - important on boards without PSRAM.
+//Passing img==NULL blanks the whole screen.
+static void display_image(spi_device_handle_t spi, const dat_image_t *img)
 {
-    uint16_t *pixels;
     uint16_t *lines[2];
 #if CONFIG_LCD_BUFFER_IN_PSRAM
     uint32_t mem_cap = MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA;
@@ -292,18 +305,46 @@ static void display_image(spi_device_handle_t spi)
 
     //Allocate memory for the pixel buffers
     for (int i = 0; i < 2; i++) {
-        lines[i] = spi_bus_dma_memory_alloc(LCD_HOST, 320 * PARALLEL_LINES * sizeof(uint16_t), mem_cap);
+        lines[i] = spi_bus_dma_memory_alloc(LCD_HOST, LCD_WIDTH * PARALLEL_LINES * sizeof(uint16_t), mem_cap);
         assert(lines[i] != NULL);
     }
-    ESP_ERROR_CHECK(decode_image(&pixels));
+
+    //Scratch row used when the image is wider than the screen (needs clipping).
+    //dat_image_render_row() always writes img->width pixels, so it cannot write
+    //directly into a 320-pixel line if the image is wider.
+    int img_w = (img != NULL) ? img->width  : 0;
+    int img_h = (img != NULL) ? img->height : 0;
+    int copy_w = (img_w < LCD_WIDTH) ? img_w : LCD_WIDTH;
+    uint16_t *scratch = NULL;
+    if (img_w > LCD_WIDTH) {
+        scratch = malloc((size_t)img_w * sizeof(uint16_t));
+        assert(scratch != NULL);
+    }
 
     //Indexes of the line currently being sent to the LCD and the line we're calculating.
     int sending_line = -1;
     int calc_line = 0;
 
-    for (int y = 0; y < IMAGE_H; y += PARALLEL_LINES) {
-        memcpy(lines[calc_line], pixels + y * IMAGE_W,
-               IMAGE_W * PARALLEL_LINES * sizeof(uint16_t));
+    for (int y = 0; y < LCD_HEIGHT; y += PARALLEL_LINES) {
+        uint16_t *dst = lines[calc_line];
+        //Fill this band of PARALLEL_LINES rows from the image, padding with black.
+        for (int r = 0; r < PARALLEL_LINES; r++) {
+            int sy = y + r;
+            uint16_t *drow = dst + r * LCD_WIDTH;
+            if (img != NULL && sy < img_h) {
+                if (scratch != NULL) {
+                    dat_image_render_row(img, sy, scratch);
+                    memcpy(drow, scratch, (size_t)copy_w * sizeof(uint16_t));
+                } else {
+                    dat_image_render_row(img, sy, drow);
+                }
+                if (copy_w < LCD_WIDTH) {
+                    memset(drow + copy_w, 0, (size_t)(LCD_WIDTH - copy_w) * sizeof(uint16_t));
+                }
+            } else {
+                memset(drow, 0, LCD_WIDTH * sizeof(uint16_t)); //0x0000 = black
+            }
+        }
         if (sending_line != -1) {
             send_line_finish(spi);
         }
@@ -312,20 +353,66 @@ static void display_image(spi_device_handle_t spi)
         send_lines(spi, y, lines[sending_line]);
     }
     send_line_finish(spi);
+
+    free(scratch);
+    free(lines[0]);
+    free(lines[1]);
+}
+
+//Decode a 16-color image resource from a DAT file and show it top-left, blanking the rest.
+//Decode a 16-color image resource from a DAT file and show it top-left, blanking the rest.
+//The palette is discovered automatically from the DAT (see read_dat_palette_for).
+static void show_dat_image(spi_device_handle_t spi, const char *dat_name, int16_t id)
+{
+    static const char *TAG = "dat_image";
+
+    uint8_t *res = NULL;
+    size_t res_size = 0;
+    esp_err_t err = read_dat_resource(dat_name, id, &res, &res_size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "resource %d not found in %s (err=%d)", id, dat_name, err);
+        display_image(spi, NULL); //blank the screen
+        return;
+    }
+
+    dat_image_t img;
+    esp_err_t dec = dat_image_decode(res, res_size, &img);
+    free(res);
+    if (dec != ESP_OK) {
+        ESP_LOGW(TAG, "%s resource %d is not a decodable 16-color image (err=0x%x)",
+                 dat_name, id, dec);
+        display_image(spi, NULL); //blank the screen
+        return;
+    }
+
+    ESP_LOGI(TAG, "%s resource %d: %dx%d, drawn top-left",
+             dat_name, id, img.width, img.height);
+
+    //Discover and apply the image's palette. If none is found, dat_image_decode
+    //already installed the fixed POP1 palette as a fallback.
+    uint8_t *pal = NULL;
+    size_t pal_size = 0;
+    int16_t pal_id = -1;
+    if (read_dat_palette_for(dat_name, id, &pal, &pal_size, &pal_id) == ESP_OK) {
+        if (dat_image_set_palette(&img, pal, pal_size) == ESP_OK) {
+            ESP_LOGI(TAG, "%s resource %d: using palette %d", dat_name, id, pal_id);
+        } else {
+            ESP_LOGW(TAG, "%s palette %d has unexpected size %u; using default",
+                     dat_name, pal_id, (unsigned)pal_size);
+        }
+        free(pal);
+    } else {
+        ESP_LOGW(TAG, "no palette found in %s; using default palette", dat_name);
+    }
+
+    display_image(spi, &img);
+    dat_image_free(&img);
 }
 
 void app_main(void)
 {
     esp_err_t ret;
     spi_device_handle_t spi;
-
-    //Parse every embedded DAT file and log its classified resources.
-    for (size_t i = 0; i < g_embedded_dats_count; i++) {
-        dat_file_t dat;
-        if (parse_dat_file(g_embedded_dats[i].name, &dat) == ESP_OK) {
-            free_dat_file(&dat);
-        }
-    }
 
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
@@ -354,5 +441,5 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
     //Initialize the LCD
     lcd_init(spi);
-    display_image(spi);
+    show_dat_image(spi, TITLE_DAT_NAME, TITLE_IMAGE_ID);
 }
