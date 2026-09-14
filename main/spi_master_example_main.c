@@ -414,6 +414,18 @@ void app_main(void)
     esp_err_t ret;
     spi_device_handle_t spi;
 
+    /* --- P0 SDLPoP port bring-up: heap feasibility + force-link the engine ---
+     * pop_main() is referenced (not called yet) so the linker pulls in the whole
+     * SDLPoP object graph, letting us shake out undefined-symbol errors against
+     * the mini-SDL shim. The heap probe tells us the largest contiguous internal
+     * block available for the game's back buffer / sprite RAM. */
+    extern void pop_main(void);
+    volatile void *pop_main_keep = (void *)&pop_main;
+    (void)pop_main_keep;
+    ESP_LOGI("pop_port", "[P0] internal heap: free=%u bytes, largest contiguous block=%u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
         .mosi_io_num = PIN_NUM_MOSI,

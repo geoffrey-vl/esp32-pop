@@ -7,7 +7,31 @@ set(srcs "spi_master_example_main.c"
     "prince_dat/src/pr_disk_shim.c"
     "prince_dat/src/rle_uncompress.c"
     "prince_dat/src/lzg_uncompress.c"
+    # SDLPoP game engine (GPLv3) + mini-SDL platform shim
+    "sdlpop_shim.c"
+    "sdlpop/seg000.c"
+    "sdlpop/seg001.c"
+    "sdlpop/seg002.c"
+    "sdlpop/seg003.c"
+    "sdlpop/seg004.c"
+    "sdlpop/seg005.c"
+    "sdlpop/seg006.c"
+    "sdlpop/seg007.c"
+    "sdlpop/seg008.c"
+    "sdlpop/seg009.c"
+    "sdlpop/seqtbl.c"
+    "sdlpop/data.c"
+    "sdlpop/stb_vorbis.c"
     )
+
+# Vendored SDLPoP/stb_vorbis are third-party sources not written against
+# ESP-IDF's strict -Werror. Relax warnings-as-errors for those files only;
+# our own code keeps the strict defaults.
+set(sdlpop_srcs
+    "sdlpop/seg000.c" "sdlpop/seg001.c" "sdlpop/seg002.c" "sdlpop/seg003.c"
+    "sdlpop/seg004.c" "sdlpop/seg005.c" "sdlpop/seg006.c" "sdlpop/seg007.c"
+    "sdlpop/seg008.c" "sdlpop/seg009.c" "sdlpop/seqtbl.c" "sdlpop/data.c"
+    "sdlpop/stb_vorbis.c")
 
 # Collect every Prince of Persia DAT file to embed into the firmware.
 file(GLOB dat_files RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "data/*.DAT")
@@ -31,6 +55,9 @@ string(APPEND dat_registry_table "};\n"
 file(WRITE "${dat_registry_src}" "${dat_registry_body}\n${dat_registry_table}")
 
 idf_component_register(SRCS ${srcs} "${dat_registry_src}"
-                    INCLUDE_DIRS "." "prince_dat/include"
-                    PRIV_REQUIRES esp_driver_spi esp_driver_gpio
+                    INCLUDE_DIRS "." "prince_dat/include" "sdlpop/shim" "sdlpop"
+                    PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer
                     EMBED_FILES ${dat_files})
+
+set_source_files_properties(${sdlpop_srcs}
+    PROPERTIES COMPILE_FLAGS "-Wno-error -w")
