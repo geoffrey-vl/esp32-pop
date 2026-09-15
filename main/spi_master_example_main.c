@@ -409,22 +409,69 @@ static void show_dat_image(spi_device_handle_t spi, const char *dat_name, int16_
     dat_image_free(&img);
 }
 
+/* --- SDLPoP engine bridge (implemented in pop_glue.c) --- */
+extern void pop_main(void);
+extern int pop_kid_x(void);
+extern int pop_kid_y(void);
+extern int pop_kid_frame(void);
+extern int pop_kid_room(void);
+extern int pop_kid_alive(void);
+extern int pop_current_level(void);
+
+/* SDLPoP command-line globals (data.c); the engine expects at least argv[0]. */
+extern int g_argc;
+extern char **g_argv;
+static char *s_pop_argv[] = { "pop", NULL };
+
+/* Reserve the three full-screen 320x200 buffers up front (in sdlpop_shim.c),
+ * before pop_main() fragments the heap. */
+extern void pop_screen_pool_init(void);
+
+static void pop_game_task(void *arg)
+{
+    (void)arg;
+    g_argc = 1;
+    g_argv = s_pop_argv;
+    ESP_LOGI("pop_port", "[P1] starting pop_main()...");
+    pop_main();                     // normally never returns
+    ESP_LOGW("pop_port", "[P1] pop_main() returned unexpectedly");
+    vTaskDelete(NULL);
+}
+
+static void pop_monitor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGI("pop_port",
+                 "[P1] lvl=%d kid(x=%d y=%d frame=%d room=%d alive=%d) heap free=%u largest=%u",
+                 pop_current_level(), pop_kid_x(), pop_kid_y(), pop_kid_frame(),
+                 pop_kid_room(), pop_kid_alive(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+}
+
 void app_main(void)
 {
     esp_err_t ret;
     spi_device_handle_t spi;
 
-    /* --- P0 SDLPoP port bring-up: heap feasibility + force-link the engine ---
-     * pop_main() is referenced (not called yet) so the linker pulls in the whole
-     * SDLPoP object graph, letting us shake out undefined-symbol errors against
-     * the mini-SDL shim. The heap probe tells us the largest contiguous internal
-     * block available for the game's back buffer / sprite RAM. */
-    extern void pop_main(void);
-    volatile void *pop_main_keep = (void *)&pop_main;
-    (void)pop_main_keep;
-    ESP_LOGI("pop_port", "[P0] internal heap: free=%u bytes, largest contiguous block=%u bytes",
+    /* --- P1 SDLPoP port bring-up: run the engine headless -------------------
+     * The game engine runs on its own FreeRTOS task with a large stack (deep
+     * call tree). Video/audio/input are shimmed (no display yet); we only want
+     * to confirm the flash-backed DAT reader works and the game loop advances.
+     * A monitor task logs heap + Kid position/level so we can watch progress
+     * over the serial console. */
+    ESP_LOGI("pop_port", "[P1] internal heap: free=%u bytes, largest contiguous block=%u bytes",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    /* Reserve the three full-screen 320x200 buffers now, while the heap is
+     * pristine (the two big regions are still intact). Doing this before SPI/LCD
+     * init and task creation guarantees all three 64KB blocks find contiguous
+     * byte-addressable RAM; later they cannot, due to fragmentation. */
+    pop_screen_pool_init();
 
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
@@ -453,5 +500,9 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
     //Initialize the LCD
     lcd_init(spi);
-    show_dat_image(spi, TITLE_DAT_NAME, TITLE_IMAGE_ID);
+
+    /* Start the SDLPoP engine and a monitor. LCD present is still a no-op in P1;
+     * the existing TITLE.DAT viewer is retired now that the engine drives things. */
+    xTaskCreatePinnedToCore(pop_game_task, "pop_game", 32768, NULL, 5, NULL, 1);
+    xTaskCreate(pop_monitor_task, "pop_mon", 4096, NULL, 3, NULL);
 }

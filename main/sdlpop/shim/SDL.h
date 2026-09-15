@@ -101,6 +101,7 @@ typedef struct SDL_Surface {
     /* shim-private */
     Uint32           colorkey;
     SDL_bool         has_colorkey;
+    SDL_bool         pool_backed;   /* pixels come from the screen-buffer pool */
 } SDL_Surface;
 
 /* Pixel format enums (only those referenced) */
@@ -503,6 +504,8 @@ int              SDL_ConvertAudio(SDL_AudioCVT *cvt);
 
 /* RWops */
 SDL_RWops   *SDL_RWFromConstMem(const void *mem, int size);
+size_t       SDL_RWwrite(SDL_RWops *context, const void *ptr, size_t size, size_t num);
+size_t       SDL_RWread(SDL_RWops *context, void *ptr, size_t size, size_t maxnum);
 int          SDL_RWclose(SDL_RWops *context);
 
 /* String helpers used by Windows path code (harmless on ESP32) */

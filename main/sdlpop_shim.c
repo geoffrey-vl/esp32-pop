@@ -11,9 +11,42 @@
 #include "SDL.h"
 #include "SDL_image.h"
 
+#include <stdio.h>
+#include <strings.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+
+#include "dat_registry.h"
+
+/* ---------------------------------------------- flash-backed DAT reader ---
+ * SDLPoP opens its .DAT files with fopen()/fread()/fseek(). There is no
+ * filesystem on the ESP32, so we serve the DAT bytes straight out of flash:
+ * every DAT is embedded via EMBED_FILES and listed in the generated
+ * g_embedded_dats registry. fmemopen() wraps a flash blob in a read-only
+ * FILE*, so SDLPoP's unmodified reader works. seg009.c's
+ * open_dat_from_root_or_data_dir() calls this first (ESP_PLATFORM only). */
+static const char *pop_basename(const char *p)
+{
+    const char *slash = strrchr(p, '/');
+    return slash ? slash + 1 : p;
+}
+
+FILE *pop_open_embedded_dat(const char *filename)
+{
+    if (filename == NULL) return NULL;
+    const char *base = pop_basename(filename);
+    for (size_t i = 0; i < g_embedded_dats_count; i++) {
+        if (strcasecmp(g_embedded_dats[i].name, base) == 0) {
+            size_t size = (size_t)(g_embedded_dats[i].end - g_embedded_dats[i].start);
+            /* fmemopen wants void*; "rb" keeps it read-only so flash is never written. */
+            return fmemopen((void *)g_embedded_dats[i].start, size, "rb");
+        }
+    }
+    return NULL;
+}
 
 /* ------------------------------------------------------------------ core */
 int         SDL_Init(Uint32 flags) { (void)flags; return 0; }
@@ -49,6 +82,59 @@ SDL_TimerID SDL_AddTimer(Uint32 interval, SDL_TimerCallback callback, void *para
 SDL_bool SDL_RemoveTimer(SDL_TimerID id) { (void)id; return SDL_TRUE; }
 
 /* -------------------------------------------------------------- surfaces */
+/* Screen-buffer pool. SDLPoP keeps persistent full-screen 320x200 surfaces;
+ * on the ESP32 each is coerced to 8-bit indexed = 64000 bytes. Desktop SDLPoP
+ * uses three (onscreen + overlay + merged), but 3 x 64KB = 192KB leaves the
+ * fragmented internal heap unable to satisfy even a 16KB dialog "peel" plus the
+ * 32KB game-task stack. This port drops merged_surface (it aliases
+ * onscreen_surface_; see init_overlay() in seg009.c) and keeps only two pooled
+ * screen buffers (onscreen + overlay = 128KB), freeing a whole 64KB heap region
+ * for transients. The blocks are reserved once, up front
+ * (pop_screen_pool_init(), called from app_main before the heap fragments),
+ * because a late 64KB contiguous request fails even when total free RAM is
+ * ample. SDL_CreateRGBSurface hands them out for 320x200 requests. */
+#define POP_SCREEN_BYTES 64000  /* 320 * 200, 8-bit indexed */
+#define POP_POOL_SLOTS   2
+static uint8_t *g_pool_block[POP_POOL_SLOTS];
+static bool     g_pool_used[POP_POOL_SLOTS];
+
+void pop_screen_pool_init(void)
+{
+    for (int i = 0; i < POP_POOL_SLOTS; i++) {
+        if (g_pool_block[i] == NULL) {
+            g_pool_block[i] = (uint8_t *)heap_caps_malloc(POP_SCREEN_BYTES,
+                                                          MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        }
+        g_pool_used[i] = false;
+        printf("pop_screen_pool_init: slot %d = %p (largest now %u)\n",
+               i, (void *)g_pool_block[i],
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    }
+}
+
+static uint8_t *pool_take(void)
+{
+    for (int i = 0; i < POP_POOL_SLOTS; i++) {
+        if (g_pool_block[i] != NULL && !g_pool_used[i]) {
+            g_pool_used[i] = true;
+            memset(g_pool_block[i], 0, POP_SCREEN_BYTES);
+            return g_pool_block[i];
+        }
+    }
+    return NULL;
+}
+
+static bool pool_return(void *p)
+{
+    for (int i = 0; i < POP_POOL_SLOTS; i++) {
+        if (g_pool_block[i] == p) {
+            g_pool_used[i] = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 static int bytes_per_pixel_for_depth(int depth)
 {
     switch (depth) {
@@ -69,16 +155,78 @@ static Uint32 format_for_depth(int depth)
     }
 }
 
+/* A single shared 256-color palette backs every sprite/font (non-screen) 8-bit
+ * surface. Real SDL gives each 8-bit surface its own 1KB palette, but POP's
+ * built-in font alone creates ~130 persistent glyph surfaces, which would cost
+ * ~130KB — impossible on a device with only ~90KB of byte-addressable RAM left
+ * after the screen-buffer pool. In this port the per-sprite palette is never
+ * used for rendering (blits are index-preserving; the global game palette is
+ * applied only at present time), so sharing one palette is safe and reclaims
+ * that RAM. The 3 full-screen buffers still get dedicated 256-color palettes. */
+static SDL_Palette *g_shared_sprite_palette = NULL;
+/* Shared 1x1 placeholder handed out by decode_image() when a sprite cannot be
+ * decoded into RAM (P2 will render sprites straight from flash instead). It is
+ * global so SDL_FreeSurface() can refuse to free it. */
+SDL_Surface *g_pop_sprite_placeholder = NULL;
+static SDL_Palette *shared_sprite_palette(void)
+{
+    if (g_shared_sprite_palette == NULL) {
+        SDL_Palette *pal = (SDL_Palette *)calloc(1, sizeof(SDL_Palette));
+        if (pal) {
+            pal->ncolors = 256;
+            pal->colors = (SDL_Color *)calloc(256, sizeof(SDL_Color));
+            if (!pal->colors) { free(pal); pal = NULL; }
+        }
+        g_shared_sprite_palette = pal;
+    }
+    return g_shared_sprite_palette;
+}
+
+static SDL_Surface *create_surface_impl(int width, int height, int depth,
+                                        Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask);
+
 SDL_Surface *SDL_CreateRGBSurface(Uint32 flags, int width, int height, int depth,
                                   Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask)
 {
     (void)flags;
+    /* The ESP32 cannot hold 24/32-bit screen buffers (320x200x3 = 192KB each;
+     * onscreen + overlay + merged would be ~640KB). Every 24/32-bit surface the
+     * engine creates *through this entry point* is screen-derived (onscreen/
+     * overlay/merged buffers and the "peel" regions that save the pixels under a
+     * dialog); those are only ever blitted (index-preserving) or FillRect'd, so
+     * we coerce them to 8-bit indexed to save RAM. The game palette maps to
+     * RGB565 only at present time (P4). This also shrinks small peels (e.g.
+     * 220x75) from ~49KB to ~16KB, which matters on the fragmented internal heap.
+     *
+     * NOTE: surfaces that are directly manipulated at their native depth (e.g.
+     * method_3_blit_mono() writes 32-bit pixels into an ARGB8888 conversion
+     * output) must NOT be coerced, or the writes overflow the buffer and corrupt
+     * the heap. Those go through SDL_ConvertSurface(Format)() which calls
+     * create_surface_impl() directly, bypassing this coercion. */
+    if (depth == 24 || depth == 32) {
+        depth = 8;
+        Rmask = Gmask = Bmask = Amask = 0;
+    }
+    return create_surface_impl(width, height, depth, Rmask, Gmask, Bmask, Amask);
+}
+
+static SDL_Surface *create_surface_impl(int width, int height, int depth,
+                                        Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask)
+{
     SDL_Surface *s = (SDL_Surface *)calloc(1, sizeof(SDL_Surface));
     SDL_PixelFormat *f = (SDL_PixelFormat *)calloc(1, sizeof(SDL_PixelFormat));
-    if (!s || !f) { free(s); free(f); return NULL; }
+    if (!s || !f) {
+        printf("CreateRGBSurface: struct alloc failed w=%d h=%d d=%d\n", width, height, depth);
+        free(s); free(f); return NULL;
+    }
 
     int bpp = bytes_per_pixel_for_depth(depth);
     int pitch = (width * bpp + 3) & ~3; /* 4-byte aligned, like SDL */
+    /* A full-screen 320x200x8 buffer is exactly POP_SCREEN_BYTES; those get a
+     * dedicated palette (each may hold a different game palette). Everything
+     * else (sprites/font glyphs) shares one global palette. */
+    size_t est_bytes = (size_t)pitch * (size_t)(height > 0 ? height : 1);
+    int is_screen = (est_bytes == POP_SCREEN_BYTES);
 
     f->format = format_for_depth(depth);
     f->BitsPerPixel = (Uint8)depth;
@@ -87,21 +235,65 @@ SDL_Surface *SDL_CreateRGBSurface(Uint32 flags, int width, int height, int depth
     f->palette = NULL;
 
     if (depth == 8) {
-        SDL_Palette *pal = (SDL_Palette *)calloc(1, sizeof(SDL_Palette));
-        if (!pal) { free(s); free(f); return NULL; }
-        pal->ncolors = 256;
-        pal->colors = (SDL_Color *)calloc(256, sizeof(SDL_Color));
-        if (!pal->colors) { free(pal); free(s); free(f); return NULL; }
-        f->palette = pal;
+        if (is_screen) {
+            SDL_Palette *pal = (SDL_Palette *)calloc(1, sizeof(SDL_Palette));
+            if (!pal) {
+                printf("CreateRGBSurface: palette struct alloc failed w=%d h=%d free=%u largest=%u\n",
+                       width, height, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                free(s); free(f); return NULL;
+            }
+            pal->ncolors = 256;
+            pal->colors = (SDL_Color *)calloc(256, sizeof(SDL_Color));
+            if (!pal->colors) {
+                printf("CreateRGBSurface: palette colors alloc failed w=%d h=%d free=%u largest=%u\n",
+                       width, height, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                free(pal); free(s); free(f); return NULL;
+            }
+            f->palette = pal;
+        } else {
+            f->palette = shared_sprite_palette();
+            if (f->palette == NULL) {
+                printf("CreateRGBSurface: shared palette alloc failed w=%d h=%d free=%u largest=%u\n",
+                       width, height, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                free(s); free(f); return NULL;
+            }
+        }
     }
 
     s->format = f;
     s->w = width;
     s->h = height;
     s->pitch = pitch;
-    s->pixels = calloc(1, (size_t)pitch * (height > 0 ? height : 1));
+    /* Some glyphs (e.g. the space character) are zero-width; SDL still returns a
+     * valid surface for those. Guard against calloc(.,0) returning NULL, which
+     * would be mistaken for an out-of-memory failure by callers like
+     * decode_image() and trigger quit()/exit(). */
+    {
+        size_t nbytes = (size_t)pitch * (size_t)(height > 0 ? height : 1);
+        if (nbytes == 0) nbytes = 1;
+        /* Full-screen 320x200 buffers come from the reserved pool to dodge heap
+         * fragmentation; everything else uses the general heap. */
+        if (nbytes == POP_SCREEN_BYTES) {
+            s->pixels = pool_take();
+            s->pool_backed = (s->pixels != NULL) ? SDL_TRUE : SDL_FALSE;
+        }
+        if (s->pixels == NULL) {
+            s->pixels = calloc(1, nbytes);
+        }
+        if (!s->pixels) {
+            printf("CreateRGBSurface: pixels alloc failed w=%d h=%d d=%d pitch=%d nbytes=%u free=%u largest=%u\n",
+                   width, height, depth, pitch, (unsigned)nbytes,
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
+    }
     if (!s->pixels) {
-        if (f->palette) { free(f->palette->colors); free(f->palette); }
+        if (f->palette && f->palette != g_shared_sprite_palette) {
+            free(f->palette->colors); free(f->palette);
+        }
         free(f); free(s);
         return NULL;
     }
@@ -115,14 +307,25 @@ SDL_Surface *SDL_CreateRGBSurface(Uint32 flags, int width, int height, int depth
 void SDL_FreeSurface(SDL_Surface *surface)
 {
     if (!surface) return;
+    /* The sprite placeholder is a single shared surface handed out when a sprite
+     * is too big to decode into RAM; many chtab entries point at it, so freeing
+     * it (on level teardown) would double-free. Never free it. */
+    if (surface == g_pop_sprite_placeholder) return;
     if (surface->format) {
-        if (surface->format->palette) {
+        /* The shared sprite palette is global and reused; never free it. */
+        if (surface->format->palette &&
+            surface->format->palette != g_shared_sprite_palette) {
             free(surface->format->palette->colors);
             free(surface->format->palette);
         }
         free(surface->format);
     }
-    free(surface->pixels);
+    /* Pool-backed pixels are returned to the reserved pool, not freed. */
+    if (surface->pool_backed) {
+        pool_return(surface->pixels);
+    } else {
+        free(surface->pixels);
+    }
     free(surface);
 }
 
@@ -206,7 +409,10 @@ SDL_Surface *SDL_ConvertSurface(SDL_Surface *src, const SDL_PixelFormat *fmt, Ui
     (void)flags;
     if (!src || !src->format) return NULL;
     int depth = fmt ? fmt->BitsPerPixel : src->format->BitsPerPixel;
-    SDL_Surface *dst = SDL_CreateRGBSurface(0, src->w, src->h, depth, 0, 0, 0, 0);
+    /* Bypass the 24/32->8 coercion in SDL_CreateRGBSurface: a conversion target
+     * keeps its requested native depth because callers may write pixels into it
+     * directly at that depth. */
+    SDL_Surface *dst = create_surface_impl(src->w, src->h, depth, 0, 0, 0, 0);
     if (!dst) return NULL;
     size_t bytes = (size_t)src->pitch * src->h;
     if (dst->pitch == src->pitch) memcpy(dst->pixels, src->pixels, bytes);
@@ -222,8 +428,33 @@ SDL_Surface *SDL_ConvertSurface(SDL_Surface *src, const SDL_PixelFormat *fmt, Ui
 
 SDL_Surface *SDL_ConvertSurfaceFormat(SDL_Surface *src, Uint32 pixel_format, Uint32 flags)
 {
-    (void)pixel_format;
-    return SDL_ConvertSurface(src, src ? src->format : NULL, flags);
+    (void)flags;
+    if (!src) return NULL;
+    /* Honor the requested pixel format's depth: some callers (e.g.
+     * method_3_blit_mono) convert an indexed sprite to ARGB8888 and then write
+     * 32-bit pixels, so the destination really must be 32-bit. */
+    int depth;
+    switch (pixel_format) {
+        case SDL_PIXELFORMAT_ARGB8888: depth = 32; break;
+        case SDL_PIXELFORMAT_RGB24:    depth = 24; break;
+        case SDL_PIXELFORMAT_INDEX8:   depth = 8;  break;
+        default: depth = src->format ? src->format->BitsPerPixel : 8; break;
+    }
+    /* Bypass the 24/32->8 coercion in SDL_CreateRGBSurface: method_3_blit_mono()
+     * converts a glyph to ARGB8888 and then writes 32-bit pixels into it, so the
+     * destination must really be 32-bit or the writes corrupt the heap. */
+    SDL_Surface *dst = create_surface_impl(src->w, src->h, depth, 0, 0, 0, 0);
+    if (!dst) return NULL;
+    if (dst->pitch == src->pitch && dst->format->BytesPerPixel == src->format->BytesPerPixel)
+        memcpy(dst->pixels, src->pixels, (size_t)src->pitch * src->h);
+    if (depth == 8 && src->format->palette && dst->format->palette) {
+        int n = src->format->palette->ncolors;
+        if (n > dst->format->palette->ncolors) n = dst->format->palette->ncolors;
+        memcpy(dst->format->palette->colors, src->format->palette->colors, (size_t)n * sizeof(SDL_Color));
+    }
+    dst->has_colorkey = src->has_colorkey;
+    dst->colorkey = src->colorkey;
+    return dst;
 }
 
 Uint32 SDL_MapRGB(const SDL_PixelFormat *format, Uint8 r, Uint8 g, Uint8 b)
@@ -320,6 +551,8 @@ int  SDL_ConvertAudio(SDL_AudioCVT *cvt) { if (cvt) cvt->len_cvt = cvt->len; ret
 
 /* ---------------------------------------------------------------- RWops */
 SDL_RWops *SDL_RWFromConstMem(const void *mem, int size) { (void)mem; (void)size; return NULL; }
+size_t     SDL_RWwrite(SDL_RWops *ctx, const void *ptr, size_t size, size_t num) { (void)ctx; (void)ptr; (void)size; (void)num; return 0; }
+size_t     SDL_RWread(SDL_RWops *ctx, void *ptr, size_t size, size_t maxnum) { (void)ctx; (void)ptr; (void)size; (void)maxnum; return 0; }
 int        SDL_RWclose(SDL_RWops *ctx) { (void)ctx; return 0; }
 
 /* ------------------------------------------------------------ SDL_image */

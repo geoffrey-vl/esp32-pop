@@ -231,6 +231,19 @@ void start_game() {
 		return;
 	}
 
+#ifdef ESP_PLATFORM
+	// The ESP32 port has no title sequence and no menu (per project scope): the
+	// intro loads a second offscreen buffer and the full set of title images,
+	// which this hardware can't spare, and there is no display/input wired to
+	// navigate a menu yet. Load the first playable level directly so the game
+	// simulation runs immediately.
+	{
+		int level_number = (start_level >= 0) ? start_level : custom->first_level;
+		init_game(level_number);
+		return;
+	}
+#endif
+
 	if (start_level < 0) {
 		show_title();
 	} else {
@@ -2266,6 +2279,13 @@ void free_all_sounds() {
 }
 
 void load_all_sounds() {
+#ifdef ESP_PLATFORM
+	// Audio is deferred to the optional final phase of the ESP32 port. Skip all
+	// sound loading: it needs ~58 buffers plus per-sound conversion allocations
+	// this hardware can't spare, and with no audio backend convert_digi_sound()
+	// dereferences a NULL digi_audiospec. Silent gameplay is intended for now.
+	return;
+#endif
 	if (!use_custom_levelset || always_use_original_music) {
 		load_sounds(0, 43);
 		load_opt_sounds(43, 56); //added
@@ -2428,6 +2448,12 @@ const char* splash_text_2 =
 		"Press any key to continue...";
 
 void show_splash() {
+#ifdef ESP_PLATFORM
+	// The info/splash screen blocks in an idle loop until the user presses a key
+	// to dismiss it. No input is wired yet and there is no menu in scope, so skip
+	// it and go straight into the game.
+	return;
+#endif
 	if (!enable_info_screen || start_level >= 0) return;
 	current_target_surface = onscreen_surface_;
 	draw_rect(&screen_rect, color_0_black);

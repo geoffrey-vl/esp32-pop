@@ -411,6 +411,14 @@ int pop_wait(int timer_index,int time) {
 
 static FILE* open_dat_from_root_or_data_dir(const char* filename) {
 	FILE* fp = NULL;
+#ifdef ESP_PLATFORM
+	// ESP32 port: there is no filesystem; serve DAT files from flash-embedded
+	// blobs (see pop_open_embedded_dat in sdlpop_shim.c). Falls through to the
+	// normal fopen path on any other platform.
+	extern FILE* pop_open_embedded_dat(const char* filename);
+	fp = pop_open_embedded_dat(filename);
+	if (fp != NULL) return fp;
+#endif
 	fp = fopen(filename, "rb");
 
 	// if failed, try if the DAT file can be opened in the data/ directory, instead of the main folder
@@ -840,6 +848,21 @@ byte* conv_to_8bpp(byte* in_data, int width, int height, int stride, int depth) 
 image_type* decode_image(image_data_type* image_data, dat_pal_type* palette) {
 	int height = SDL_SwapLE16(image_data->height);
 	if (height == 0) return NULL;
+#ifdef ESP_PLATFORM
+	// P1 headless bring-up: there is no byte-addressable RAM to decode sprites
+	// into (the screen buffers consume it), and decode_image's temp buffers
+	// (dest + image_8bpp) alone can exceed the free heap. Sprites are not needed
+	// to run the game simulation (physics uses the sequence tables, and blits are
+	// no-ops for now); the real sprites will be rendered straight from flash by
+	// the P2/P3 pipeline. Hand back a single shared placeholder so chtabs are
+	// fully populated with valid (non-NULL) image pointers.
+	(void)palette;
+	extern image_type* g_pop_sprite_placeholder;
+	if (g_pop_sprite_placeholder == NULL) {
+		g_pop_sprite_placeholder = SDL_CreateRGBSurface(0, 1, 1, 8, 0, 0, 0, 0);
+	}
+	return g_pop_sprite_placeholder;
+#else
 	int width = SDL_SwapLE16(image_data->width);
 	int flags = SDL_SwapLE16(image_data->flags);
 	int depth = ((flags >> 12) & 7) + 1;
@@ -881,6 +904,7 @@ image_type* decode_image(image_data_type* image_data, dat_pal_type* palette) {
 	colors[0].a = SDL_ALPHA_TRANSPARENT;
 	SDL_SetPaletteColors(image->format->palette, colors, 0, 16); // SDL_SetColors = deprecated
 	return image;
+#endif // ESP_PLATFORM
 }
 
 // seg009:121A
@@ -2153,6 +2177,14 @@ void audio_callback(void* userdata, Uint8* stream_orig, int len_orig) {
 
 int digi_unavailable = 0;
 void init_digi() {
+#ifdef ESP_PLATFORM
+	// Audio is out of scope for now (optional, deferred to the final phase).
+	// Mark it permanently unavailable so every sound path (load_sound,
+	// convert_digi_sound, play_*_sound, ...) short-circuits via its existing
+	// `if (digi_unavailable)` guard instead of allocating/converting samples.
+	digi_unavailable = 1;
+	return;
+#endif
 	if (digi_unavailable) return;
 	if (digi_audiospec != NULL) return;
 	// Open the audio device. Called once.
@@ -2510,7 +2542,17 @@ void init_overlay(void) {
 	static bool initialized = false;
 	if (!initialized) {
 		overlay_surface = SDL_CreateRGBSurface(0, 320, 200, 32, Rmsk, Gmsk, Bmsk, Amsk);
+#ifdef ESP_PLATFORM
+		// ESP32 port: there is not enough internal RAM for a third full-screen
+		// (64KB) buffer alongside onscreen + overlay. merged_surface is only a
+		// present-time composite of onscreen + overlay; this port presents
+		// onscreen directly (compositing the overlay during LCD scan-out), so we
+		// alias merged_surface to onscreen_surface_ instead of allocating it.
+		// onscreen_surface_ is already created by set_gr_mode() at this point.
+		merged_surface = onscreen_surface_;
+#else
 		merged_surface = SDL_CreateRGBSurface(0, 320, 200, 24, Rmsk, Gmsk, Bmsk, 0);
+#endif
 		initialized = true;
 	}
 }

@@ -9,6 +9,7 @@ set(srcs "spi_master_example_main.c"
     "prince_dat/src/lzg_uncompress.c"
     # SDLPoP game engine (GPLv3) + mini-SDL platform shim
     "sdlpop_shim.c"
+    "pop_glue.c"
     "sdlpop/seg000.c"
     "sdlpop/seg001.c"
     "sdlpop/seg002.c"
@@ -21,7 +22,9 @@ set(srcs "spi_master_example_main.c"
     "sdlpop/seg009.c"
     "sdlpop/seqtbl.c"
     "sdlpop/data.c"
+    "sdlpop/options.c"
     "sdlpop/stb_vorbis.c"
+    "pop_stubs.c"
     )
 
 # Vendored SDLPoP/stb_vorbis are third-party sources not written against
@@ -31,7 +34,7 @@ set(sdlpop_srcs
     "sdlpop/seg000.c" "sdlpop/seg001.c" "sdlpop/seg002.c" "sdlpop/seg003.c"
     "sdlpop/seg004.c" "sdlpop/seg005.c" "sdlpop/seg006.c" "sdlpop/seg007.c"
     "sdlpop/seg008.c" "sdlpop/seg009.c" "sdlpop/seqtbl.c" "sdlpop/data.c"
-    "sdlpop/stb_vorbis.c")
+    "sdlpop/options.c" "sdlpop/stb_vorbis.c" "pop_glue.c" "pop_stubs.c")
 
 # Collect every Prince of Persia DAT file to embed into the firmware.
 file(GLOB dat_files RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "data/*.DAT")
