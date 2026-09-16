@@ -43,7 +43,9 @@
 
 #define PIN_NUM_DC   21 // D21
 #define PIN_NUM_RST  22 // D22
-#define PIN_NUM_BCKL 2 // D2
+//Backlight is hard-wired on and not driven by the MCU. Set to a real GPIO to
+//re-enable MCU control; leave as GPIO_NUM_NC (-1) to compile out the backlight code.
+#define PIN_NUM_BCKL GPIO_NUM_NC
 
 #define LCD_BK_LIGHT_ON_LEVEL   0
 
@@ -187,7 +189,10 @@ void lcd_init(spi_device_handle_t spi)
 
     //Initialize non-SPI GPIOs
     gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = ((1ULL << PIN_NUM_DC) | (1ULL << PIN_NUM_RST) | (1ULL << PIN_NUM_BCKL));
+    io_conf.pin_bit_mask = ((1ULL << PIN_NUM_DC) | (1ULL << PIN_NUM_RST));
+#if PIN_NUM_BCKL >= 0
+    io_conf.pin_bit_mask |= (1ULL << PIN_NUM_BCKL);
+#endif
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
@@ -210,8 +215,10 @@ void lcd_init(spi_device_handle_t spi)
         cmd++;
     }
 
-    ///Enable backlight
+#if PIN_NUM_BCKL >= 0
+    ///Enable backlight (only when the backlight pin is driven by the MCU)
     gpio_set_level(PIN_NUM_BCKL, LCD_BK_LIGHT_ON_LEVEL);
+#endif
 }
 
 /* To send a set of lines we have to send a command, 2 data bytes, another command, 2 more data bytes and another command
