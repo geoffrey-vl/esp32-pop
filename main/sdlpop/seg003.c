@@ -254,7 +254,18 @@ void redraw_screen(int drawing_different_room) {
 	} else {
 		if (curr_guard_color) {
 			// Moved *before* drawings.
+#ifdef ESP_PLATFORM
+			// ESP32 port: sprites are baked with global palette-row indices and
+			// rendered through the single global palette[] (the per-sprite SDL
+			// palettes set_chtab_palette() touches are ignored by the INDEX8
+			// blit). The guard shpl (res 750) is all-black; its real colors live
+			// in guard_palettes and in the DOS original are written straight to
+			// palette row 0x80..0x8F. Do exactly that here so the guard is not
+			// drawn all black.
+			set_pal_arr(0x80, 0x10, (rgb_type*)&guard_palettes[0x30 * curr_guard_color - 0x30]);
+#else
 			set_chtab_palette(chtab_addrs[id_chtab_5_guard], &guard_palettes[0x30 * curr_guard_color - 0x30], 0x10);
+#endif
 		}
 		need_drects = 0;
 		redraw_room();
