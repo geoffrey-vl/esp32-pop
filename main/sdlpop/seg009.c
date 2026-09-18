@@ -471,6 +471,37 @@ dat_type* open_dat(const char* filename, int optional) {
 	pointer->next_dat = dat_chain_ptr;
 	dat_chain_ptr = pointer;
 
+#ifdef ESP_PLATFORM
+	// ESP32 port: read the DAT header and resource table straight from the
+	// flash-embedded blob by pointer (no FILE*/fseek — picolibc's fseek on
+	// memory streams is unreliable). Resource bytes are later memcpy'd in
+	// load_from_opendats_metadata/_alloc/_to_area via pointer->flash_base.
+	if (fp != NULL) { fclose(fp); fp = NULL; }
+	{
+		extern int pop_get_embedded_dat(const char*, const unsigned char**, size_t*);
+		const unsigned char* fb = NULL;
+		size_t fs = 0;
+		if (pop_get_embedded_dat(filename, &fb, &fs) && fs >= 6) {
+			memcpy(&dat_header, fb, 6);
+			uint32_t toff = SDL_SwapLE32(dat_header.table_offset);
+			uint16_t tsize = SDL_SwapLE16(dat_header.table_size);
+			if ((size_t)toff + tsize <= fs) {
+				// Point the resource table straight into flash (read-only, never
+				// freed): no RAM copy, so this never fails under heap pressure.
+				pointer->dat_table = (dat_table_type*)(fb + toff);
+				pointer->flash_base = fb;
+				pointer->flash_size = fs;
+			} else {
+				printf("open_dat(%s): bad table (off=%u size=%u dat=%u)\n",
+				       filename, (unsigned)toff, (unsigned)tsize, (unsigned)fs);
+			}
+		} else if (optional == 0) {
+			printf("open_dat(%s): not embedded\n", filename);
+		}
+	}
+	goto out;
+#endif
+
 	if (fp != NULL) {
 		if (fread(&dat_header, 6, 1, fp) != 1)
 			goto failed;
@@ -572,6 +603,42 @@ chtab_type* load_sprites_from_file(int resource,int palette_bits, int quit_on_er
 	chtab_type* chtab = (chtab_type*) malloc(alloc_size);
 	memset(chtab, 0, alloc_size);
 	chtab->n_images = n_images;
+#ifdef ESP_PLATFORM
+	// ESP32 port (P2): sprites are pre-decoded to flash (assets/pop_sprites.bin)
+	// and rendered straight from there; we never decode into RAM. Look up the
+	// baked chtab by the DAT file just opened + base resource and back each
+	// image_type with flash pixels. The shpl palette obtained above is still
+	// applied via set_loaded_palette() below, exactly as on desktop.
+	{
+		extern int pop_sprites_find(const char*, int);
+		extern const unsigned char* pop_sprites_image(int, int, int*, int*);
+		extern SDL_Surface* pop_make_flash_surface(const void*, int, int);
+		extern image_type* g_pop_sprite_placeholder;
+		int fidx = pop_sprites_find(dat_chain_ptr->filename, resource);
+		for (int i = 1; i <= n_images; i++) {
+			image_type* image;
+			if (fidx >= 0) {
+				int w, h;
+				const unsigned char* px = pop_sprites_image(fidx, i - 1, &w, &h);
+				// NULL for empty slots (desktop parity: decode_image returns
+				// NULL when height == 0).
+				image = px ? pop_make_flash_surface(px, w, h) : NULL;
+			} else {
+				// chtab not baked (built-in font res 1000, title res 40/50, or
+				// cutscene graphics not yet baked): hand back the shared 1x1
+				// placeholder so nothing dereferences a NULL image_type.
+				if (g_pop_sprite_placeholder == NULL) {
+					g_pop_sprite_placeholder = SDL_CreateRGBSurface(0, 1, 1, 8, 0, 0, 0, 0);
+				}
+				image = g_pop_sprite_placeholder;
+			}
+			chtab->images[i - 1] = image;
+		}
+	}
+	set_loaded_palette(pal_ptr);
+	free(shpl);
+	return chtab;
+#else
 	for (int i = 1; i <= n_images; i++) {
 		SDL_Surface* image = load_image(resource + i, pal_ptr);
 //		if (image == NULL) printf(" failed");
@@ -594,6 +661,7 @@ chtab_type* load_sprites_from_file(int resource,int palette_bits, int quit_on_er
 	}
 	set_loaded_palette(pal_ptr);
 	return chtab;
+#endif
 }
 
 // seg009:11A8
@@ -2261,6 +2329,12 @@ sound_buffer_type* convert_digi_sound(sound_buffer_type* digi_buffer);
 sound_buffer_type* load_sound(int index) {
 	sound_buffer_type* result = NULL;
 	//printf("load_sound(%d)\n", index);
+#ifdef ESP_PLATFORM
+	// Audio is out of scope for the ESP32 port (for now): skip all sound loading
+	// so we don't consume the scarce 8-bit heap. Callers tolerate NULL buffers.
+	(void)index;
+	return NULL;
+#endif
 	init_digi();
 	if (enable_music && !digi_unavailable && result == NULL && index >= 0 && index < max_sound_id) {
 		//printf("Trying to load from music folder\n");
@@ -2541,16 +2615,17 @@ void window_resized() {
 void init_overlay(void) {
 	static bool initialized = false;
 	if (!initialized) {
-		overlay_surface = SDL_CreateRGBSurface(0, 320, 200, 32, Rmsk, Gmsk, Bmsk, Amsk);
 #ifdef ESP_PLATFORM
-		// ESP32 port: there is not enough internal RAM for a third full-screen
-		// (64KB) buffer alongside onscreen + overlay. merged_surface is only a
-		// present-time composite of onscreen + overlay; this port presents
-		// onscreen directly (compositing the overlay during LCD scan-out), so we
-		// alias merged_surface to onscreen_surface_ instead of allocating it.
-		// onscreen_surface_ is already created by set_gr_mode() at this point.
+		// The overlay (menu / debug timer) is never displayed in this port
+		// (USE_MENU / USE_DEBUG_CHEATS are off), so don't spend a 64KB buffer on
+		// it: alias overlay_surface and merged_surface to onscreen_surface_.
+		// get_final_surface() returns onscreen_surface_ anyway (is_overlay_
+		// displayed stays false); draw_rect_with_alpha()/draw_rect_contours()
+		// only read overlay_surface->format, which onscreen_surface_ provides.
+		overlay_surface = onscreen_surface_;
 		merged_surface = onscreen_surface_;
 #else
+		overlay_surface = SDL_CreateRGBSurface(0, 320, 200, 32, Rmsk, Gmsk, Bmsk, Amsk);
 		merged_surface = SDL_CreateRGBSurface(0, 320, 200, 24, Rmsk, Gmsk, Bmsk, 0);
 #endif
 		initialized = true;
@@ -2807,6 +2882,15 @@ void draw_overlay(void) {
 void update_screen() {
 	draw_overlay();
 	SDL_Surface* surface = get_final_surface();
+#ifdef ESP_PLATFORM
+	// ESP32 port: map the final INDEX8 frame to RGB565 and stream it to the LCD.
+	if (surface != NULL && surface->pixels != NULL) {
+		extern void pop_present_indexed(const unsigned char*, int, int, int);
+		pop_present_indexed((const unsigned char*)surface->pixels,
+		                    surface->w, surface->h, surface->pitch);
+	}
+	return;
+#else
 	init_scaling();
 	if (scaling_type == 1) {
 		// Make "fuzzy pixels" like DOSBox does:
@@ -2831,6 +2915,7 @@ void update_screen() {
 	SDL_RenderClear(renderer_);
 	SDL_RenderCopy(renderer_, target_texture, NULL, NULL);
 	SDL_RenderPresent(renderer_);
+#endif
 }
 
 // seg009:9289
@@ -2894,6 +2979,36 @@ void load_from_opendats_metadata(int resource_id, const char* extension, FILE** 
 	// Go through all open DAT files.
 	for (dat_type* pointer = dat_chain_ptr; fp == NULL && pointer != NULL; pointer = pointer->next_dat) {
 		*out_pointer = pointer;
+#ifdef ESP_PLATFORM
+		// ESP32 port: resolve the resource by direct flash pointer. No FILE*,
+		// no fseek; the resource bytes are memcpy'd by the callers using
+		// pointer->flash_res_ptr set below.
+		if (pointer->flash_base != NULL) {
+			dat_table_type* dat_table = pointer->dat_table;
+			int rc = SDL_SwapLE16(dat_table->res_count);
+			int i;
+			for (i = 0; i < rc; ++i) {
+				if (SDL_SwapLE16(dat_table->entries[i].id) == resource_id) break;
+			}
+			if (i < rc) {
+				int sz = SDL_SwapLE16(dat_table->entries[i].size);
+				uint32_t off = SDL_SwapLE32(dat_table->entries[i].offset);
+				// Skip empty images in DATs (see desktop path), so callers can
+				// fall back to NULL for teleport/empty graphics.
+				if (!(strcmp(extension, "png") == 0 && sz <= 2) &&
+				    (size_t)off + (size_t)sz + 1 <= pointer->flash_size) {
+					*result = data_DAT;
+					*size = sz;
+					*checksum = pointer->flash_base[off];
+					pointer->flash_res_ptr = pointer->flash_base + off + 1; // past checksum byte
+					pointer->flash_res_size = sz;
+					*out_fp = NULL; // readers use flash_res_ptr on ESP
+					return;
+				}
+			}
+			continue; // not in this DAT (no directory fallback on device)
+		}
+#endif
 		if (pointer->handle != NULL) {
 			// If it's an actual DAT file:
 			fp = pointer->handle;
@@ -2986,7 +3101,13 @@ void close_dat(dat_type* pointer) {
 		if (curr == pointer) {
 			*prev = curr->next_dat;
 			if (curr->handle) fclose(curr->handle);
+#ifdef ESP_PLATFORM
+			// dat_table points into flash for embedded DATs (flash_base != NULL);
+			// only free it when it was really malloc'd (directory/desktop case).
+			if (curr->flash_base == NULL && curr->dat_table) free(curr->dat_table);
+#else
 			if (curr->dat_table) free(curr->dat_table);
+#endif
 			free(curr);
 			return;
 		}
@@ -3010,7 +3131,16 @@ void *load_from_opendats_alloc(int resource, const char* extension, data_locatio
 	if (out_size != NULL) *out_size = size;
 	if (result == data_none) return NULL;
 	void* area = malloc(size);
+	if (area == NULL) {
+		if (out_result != NULL) *out_result = data_none;
+		if (out_size != NULL) *out_size = 0;
+		return NULL;
+	}
 	//read(fd, area, size);
+#ifdef ESP_PLATFORM
+	// ESP32 port: copy the resource straight out of flash (no FILE*).
+	memcpy(area, pointer->flash_res_ptr, size);
+#else
 	if (fread(area, size, 1, fp) != 1) {
 		fprintf(stderr, "%s: %s, resource %d, size %d, failed: %s\n",
 			__func__, pointer->filename, resource,
@@ -3019,6 +3149,7 @@ void *load_from_opendats_alloc(int resource, const char* extension, data_locatio
 		area = NULL;
 	}
 	if (result == data_directory) fclose(fp);
+#endif
 	/* XXX: check checksum */
 	return area;
 }
@@ -3034,6 +3165,10 @@ int load_from_opendats_to_area(int resource,void* area,int length, const char* e
 	FILE* fp = NULL;
 	load_from_opendats_metadata(resource, extension, &fp, &result, &checksum, &size, &pointer);
 	if (result == data_none) return 0;
+#ifdef ESP_PLATFORM
+	// ESP32 port: copy the resource straight out of flash (no FILE*).
+	memcpy(area, pointer->flash_res_ptr, MIN(size, length));
+#else
 	if (fread(area, MIN(size, length), 1, fp) != 1) {
 		fprintf(stderr, "%s: %s, resource %d, size %d, failed: %s\n",
 			__func__, pointer->filename, resource,
@@ -3041,6 +3176,7 @@ int load_from_opendats_to_area(int resource,void* area,int length, const char* e
 		memset(area, 0, MIN(size, length));
 	}
 	if (result == data_directory) fclose(fp);
+#endif
 	/* XXX: check checksum */
 	return 0;
 }
@@ -3082,6 +3218,36 @@ void method_1_blit_rect(surface_type* target_surface,surface_type* source_surfac
 image_type* method_3_blit_mono(image_type* image,int xpos,int ypos,int blitter,byte color) {
 	int w = image->w;
 	int h = image->h;
+#ifdef ESP_PLATFORM
+	// INDEX8 port: stamp the palette index `color` onto the target wherever the
+	// source sprite is non-transparent (index != 0). No 32-bit temp surface.
+	(void)blitter;
+	SDL_Surface* dst = current_target_surface;
+	if (image == NULL || dst == NULL || image->pixels == NULL || dst->pixels == NULL)
+		return image;
+	const byte* spix = (const byte*)image->pixels;
+	byte* dpix = (byte*)dst->pixels;
+	int spitch = image->pitch;
+	int dpitch = dst->pitch;
+	int cx0 = dst->clip_rect.x, cy0 = dst->clip_rect.y;
+	int cx1 = cx0 + dst->clip_rect.w, cy1 = cy0 + dst->clip_rect.h;
+	if (cx0 < 0) cx0 = 0;
+	if (cy0 < 0) cy0 = 0;
+	if (cx1 > dst->w) cx1 = dst->w;
+	if (cy1 > dst->h) cy1 = dst->h;
+	for (int y = 0; y < h; ++y) {
+		int ty = ypos + y;
+		if (ty < cy0 || ty >= cy1) continue;
+		const byte* s = spix + (size_t)y * spitch;
+		byte* d = dpix + (size_t)ty * dpitch;
+		for (int x = 0; x < w; ++x) {
+			int tx = xpos + x;
+			if (tx < cx0 || tx >= cx1) continue;
+			if (s[x] != 0) d[tx] = color;
+		}
+	}
+	return image;
+#else
 	if (SDL_SetColorKey(image, SDL_TRUE, 0) != 0) {
 		sdlperror("method_3_blit_mono: SDL_SetColorKey");
 		quit(1);
@@ -3128,6 +3294,7 @@ image_type* method_3_blit_mono(image_type* image,int xpos,int ypos,int blitter,b
 	SDL_FreeSurface(colored_image);
 
 	return image;
+#endif
 }
 
 // Workaround for a bug in SDL2 (before v2.0.4):
@@ -3166,6 +3333,15 @@ int safe_SDL_FillRect(SDL_Surface* dst, const SDL_Rect* rect, Uint32 color) {
 const rect_type* method_5_rect(const rect_type* rect,int blit,byte color) {
 	SDL_Rect dest_rect;
 	rect_to_sdlrect(rect, &dest_rect);
+#ifdef ESP_PLATFORM
+	// INDEX8 port: fill directly with the palette index `color`.
+	(void)blit;
+	if (safe_SDL_FillRect(current_target_surface, &dest_rect, color) != 0) {
+		sdlperror("method_5_rect: SDL_FillRect");
+		quit(1);
+	}
+	return rect;
+#else
 	rgb_type palette_color = palette[color];
 #ifndef USE_ALPHA
 	uint32_t rgb_color = SDL_MapRGBA(current_target_surface->format, palette_color.r<<2, palette_color.g<<2, palette_color.b<<2, 0xFF);
@@ -3177,6 +3353,7 @@ const rect_type* method_5_rect(const rect_type* rect,int blit,byte color) {
 		quit(1);
 	}
 	return rect;
+#endif
 }
 
 void draw_rect_with_alpha(const rect_type* rect, byte color, byte alpha) {
@@ -3234,6 +3411,29 @@ void blit_xor(SDL_Surface* target_surface, SDL_Rect* dest_rect, SDL_Surface* ima
 		printf("blit_xor: dest_rect and src_rect have different sizes\n");
 		quit(1);
 	}
+#ifdef ESP_PLATFORM
+	// INDEX8 port: XOR source indices into the target region (used for the
+	// flash effect). No 24-bit helper surface needed.
+	if (!target_surface || !image || !target_surface->pixels || !image->pixels) return;
+	int w = src_rect->w, h = src_rect->h;
+	int sx = src_rect->x, sy = src_rect->y;
+	int dx = dest_rect->x, dy = dest_rect->y;
+	int cx1 = target_surface->w, cy1 = target_surface->h;
+	const byte* spix = (const byte*)image->pixels;
+	byte* dpix = (byte*)target_surface->pixels;
+	for (int y = 0; y < h; ++y) {
+		int ty = dy + y, syy = sy + y;
+		if (ty < 0 || ty >= cy1 || syy < 0 || syy >= image->h) continue;
+		const byte* s = spix + (size_t)syy * image->pitch;
+		byte* d = dpix + (size_t)ty * target_surface->pitch;
+		for (int x = 0; x < w; ++x) {
+			int tx = dx + x, sxx = sx + x;
+			if (tx < 0 || tx >= cx1 || sxx < 0 || sxx >= image->w) continue;
+			d[tx] ^= s[sxx];
+		}
+	}
+	return;
+#else
 	SDL_Surface* helper_surface = SDL_CreateRGBSurface(0, dest_rect->w, dest_rect->h, 24, Rmsk, Gmsk, Bmsk, 0);
 	if (helper_surface == NULL) {
 		sdlperror("blit_xor: SDL_CreateRGBSurface");
@@ -3277,6 +3477,7 @@ void blit_xor(SDL_Surface* target_surface, SDL_Rect* dest_rect, SDL_Surface* ima
 	}
 	SDL_FreeSurface(image_24);
 	SDL_FreeSurface(helper_surface);
+#endif
 }
 
 #ifdef USE_COLORED_TORCHES
@@ -3466,12 +3667,54 @@ void toggle_fullscreen(void) {
 
 bool ignore_tab = false;
 
+#ifdef ESP_PLATFORM
+// P5 input: poll the five hardware push-buttons (implemented in the main app)
+// and translate them into SDLPoP key_states[]/last_key_scancode, exactly as the
+// SDL2 KEYDOWN/KEYUP handlers below would. read_keyb_control() then maps these
+// arrow/shift scancodes onto the Kid's controls (control_x/control_y/control_shift).
+extern unsigned int pop_read_buttons(void); // bitmask, see spi_master_example_main.c
+#define POP_BTN_LEFT   (1u << 0)
+#define POP_BTN_RIGHT  (1u << 1)
+#define POP_BTN_UP     (1u << 2)
+#define POP_BTN_DOWN   (1u << 3)
+#define POP_BTN_SHIFT  (1u << 4)
+
+static void pop_esp_apply_button(unsigned int now, unsigned int mask, int scancode, int is_control_key) {
+	if (now & mask) {
+		if ((key_states[scancode] & KEYSTATE_HELD) == 0) {
+			// New press edge.
+			key_states[scancode] |= KEYSTATE_HELD | KEYSTATE_HELD_NEW;
+			last_any_key_scancode = scancode;
+			// Arrow keys also count as a "key press" that advances the title /
+			// attract sequence; Shift is ignored by itself (matches SDL path).
+			if (!is_control_key) last_key_scancode = scancode;
+		}
+	} else {
+		key_states[scancode] &= ~KEYSTATE_HELD;
+	}
+}
+
+static void pop_esp_poll_input(void) {
+	unsigned int now = pop_read_buttons();
+	pop_esp_apply_button(now, POP_BTN_LEFT,  SDL_SCANCODE_LEFT,   0);
+	pop_esp_apply_button(now, POP_BTN_RIGHT, SDL_SCANCODE_RIGHT,  0);
+	pop_esp_apply_button(now, POP_BTN_UP,    SDL_SCANCODE_UP,     0);
+	pop_esp_apply_button(now, POP_BTN_DOWN,  SDL_SCANCODE_DOWN,   0);
+	pop_esp_apply_button(now, POP_BTN_SHIFT, SDL_SCANCODE_LSHIFT, 1);
+}
+#endif // ESP_PLATFORM
+
 void process_events() {
 	// Process all events in the queue.
 	// Previously, this procedure would wait for *one* event and process it, then return.
 	// Much like the x86 HLT instruction.
 	// (We still want to process all events in the queue. For instance, there might be
 	// simultaneous SDL2 KEYDOWN and TEXTINPUT events.)
+#ifdef ESP_PLATFORM
+	// No SDL event source on the device; input comes from GPIO buttons.
+	pop_esp_poll_input();
+	return;
+#endif
 	SDL_Event event;
 	while (SDL_PollEvent(&event) == 1) { // while there are still events to be processed
 		switch (event.type) {
@@ -3843,6 +4086,14 @@ void do_simple_wait(int timer_index) {
 	if ((replaying && skipping_replay) || is_validate_mode) return;
 #endif
 	update_screen();
+#ifdef ESP_PLATFORM
+	// On the device a single frame (blocking SPI present) takes longer than one
+	// game tick, so has_timer_stopped() is already true here and the wait loop
+	// below never runs. process_events() is the only place button GPIOs are
+	// sampled into key_states[], so poll it unconditionally every frame to keep
+	// input alive regardless of timing.
+	process_events();
+#endif
 	while (! has_timer_stopped(timer_index)) {
 		SDL_Delay(1);
 		process_events();

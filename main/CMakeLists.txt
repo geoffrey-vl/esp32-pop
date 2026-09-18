@@ -1,6 +1,7 @@
 set(srcs "spi_master_example_main.c"
     "dat_file.c"
     "dat_image.c"
+    "pop_sprites.c"
     "prince_dat/src/dat.c"
     "prince_dat/src/autodetect.c"
     "prince_dat/src/auxiliary.c"
@@ -60,7 +61,7 @@ file(WRITE "${dat_registry_src}" "${dat_registry_body}\n${dat_registry_table}")
 idf_component_register(SRCS ${srcs} "${dat_registry_src}"
                     INCLUDE_DIRS "." "prince_dat/include" "sdlpop/shim" "sdlpop"
                     PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer
-                    EMBED_FILES ${dat_files})
+                    EMBED_FILES ${dat_files} "assets/pop_sprites.bin")
 
 set_source_files_properties(${sdlpop_srcs}
     PROPERTIES COMPILE_FLAGS "-Wno-error -w")

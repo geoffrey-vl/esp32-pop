@@ -102,6 +102,7 @@ typedef struct SDL_Surface {
     Uint32           colorkey;
     SDL_bool         has_colorkey;
     SDL_bool         pool_backed;   /* pixels come from the screen-buffer pool */
+    SDL_bool         flash_backed;  /* pixels + format are in read-only flash (sprites) */
 } SDL_Surface;
 
 /* Pixel format enums (only those referenced) */

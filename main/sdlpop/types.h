@@ -456,6 +456,16 @@ typedef struct dat_type {
 	char filename[POP_MAX_PATH];
 	dat_table_type* dat_table;
 	// handle and dat_table are NULL if the DAT is a directory.
+#ifdef ESP_PLATFORM
+	// ESP32 port: DATs live in flash and are read by direct pointer access
+	// (picolibc's fseek on memory FILE* streams is unreliable). flash_base/size
+	// describe the whole embedded DAT; flash_res_ptr/size are set by
+	// load_from_opendats_metadata to the resource selected by the last lookup.
+	const unsigned char* flash_base;
+	size_t flash_size;
+	const unsigned char* flash_res_ptr;
+	int flash_res_size;
+#endif
 } dat_type;
 
 typedef void (*cutscene_ptr_type)(void);

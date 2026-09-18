@@ -21,6 +21,75 @@ Depends on boards. The GPIO number used by this example can be changed in `spi_m
 
 Especially, please pay attention to the level used to turn on the LCD backlight, some LCD module needs a low level to turn it on, while others take a high level. You can change the backlight level macro LCD_BK_LIGHT_ON_LEVEL in `spi_master_example_main.c`.
 
+### Wiring
+
+The pin assignments below are the defaults in `main/spi_master_example_main.c`.
+
+**ILI9341 SPI display**
+
+| LCD pin | ESP32 GPIO | Notes |
+| ------- | ---------- | ----- |
+| VCC | 3V3 | |
+| GND | GND | |
+| CLK / SCK | GPIO18 | SPI clock |
+| MOSI / SDI | GPIO23 | SPI data to LCD |
+| MISO / SDO | GPIO19 | SPI data from LCD (optional) |
+| CS | GPIO5 | Chip select |
+| DC / RS | GPIO21 | Data/command select |
+| RST | GPIO22 | Reset |
+| LED / BLK | 3V3 | Backlight hard-wired on (set `PIN_NUM_BCKL` to a GPIO for MCU control) |
+
+**Player buttons** — five momentary push-buttons. Wire one leg of each button to
+its GPIO and the other leg to **GND**. The firmware enables the ESP32 internal
+pull-ups, so a pressed button reads LOW; no external resistors are needed.
+
+| Button | ESP32 GPIO | In-game action |
+| ------ | ---------- | -------------- |
+| Left | GPIO32 | Walk / run left |
+| Right | GPIO33 | Walk / run right |
+| Up | GPIO25 | Jump / climb up |
+| Down | GPIO26 | Crouch / climb down / pick up |
+| Shift | GPIO27 | Grab ledge / careful step / draw & sheathe sword |
+
+> Avoid the GPIOs already used by the LCD (5, 18, 19, 21, 22, 23) and the
+> input-only pins 34–39 (they have no internal pull-up).
+
+**Full wiring diagram**
+
+Drawn for a common 30-pin **ESP32 DevKit v1** (DOIT/WROOM) board. The five
+buttons all live on the left header and the LCD pins on the right header, so the
+two peripherals wire to opposite sides.
+
+```
+                          ESP32 DevKit v1
+                        +-----------------+
+                        |                 |
+                        |                 |        ILI9341 SPI TFT
+                     EN o                 o GND    +--------------+
+                   VP36 o                 o 23 ----| VCC   -> 3V3 |
+                   VN39 o                 o 22 ----| GND   -> GND |
+                     34 o                 o TX0    | CLK   -> 18  |
+  Buttons:           35 o                 o RX0    | MOSI  -> 23  |
+  (Left)  GND-[/_]-- 32 o                 o 21 ----| MISO  -> 19  |
+  (Right) GND-[/_]-- 33 o                 o 19 ----| CS    -> 5   |
+  (Up)    GND-[/_]-- 25 o                 o 18 ----| DC/RS -> 21  |
+  (Down)  GND-[/_]-- 26 o                 o 5  ----| RST   -> 22  |
+  (Shift) GND-[/_]-- 27 o                 o 17     | LED   -> 3V3 |
+                     14 o                 o 16     +--------------+
+                     12 o                 o 4
+                     13 o                 o 0
+                    GND o-----------------o 2   (optional: LCD backlight)
+                    VIN o                 o 15
+                        |                 o GND
+                        |      [USB]      o 3V3 --> LCD VCC / LED
+                        +-----------------+
+```
+
+Legend: `o` = header pin · `[ /_ ]` = momentary push-button. The firmware
+enables the ESP32 internal pull-ups, so an open button reads HIGH and a pressed
+button pulls its GPIO to GND (LOW). Tie all the button GNDs and the LCD GND to a
+common board GND.
+
 ### Build and Flash
 
 Run `idf.py -p PORT flash monitor` to build, flash and monitor the project.

@@ -12,7 +12,10 @@
 #include "SDL_image.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <strings.h>
+#include <sys/types.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,13 +28,56 @@
  * SDLPoP opens its .DAT files with fopen()/fread()/fseek(). There is no
  * filesystem on the ESP32, so we serve the DAT bytes straight out of flash:
  * every DAT is embedded via EMBED_FILES and listed in the generated
- * g_embedded_dats registry. fmemopen() wraps a flash blob in a read-only
- * FILE*, so SDLPoP's unmodified reader works. seg009.c's
+ * g_embedded_dats registry. We wrap the flash blob in a FILE* with
+ * fopencookie() and our own read/seek callbacks operating on a tiny cursor
+ * cookie. fopencookie is used instead of fmemopen() because ESP-IDF's libc
+ * fmemopen read/seek proved unreliable across repeated opens (fseek returned
+ * ENOSYS on later opens of the same file); a self-contained cookie stream is
+ * fully under our control and has no such limitation. seg009.c's
  * open_dat_from_root_or_data_dir() calls this first (ESP_PLATFORM only). */
 static const char *pop_basename(const char *p)
 {
     const char *slash = strrchr(p, '/');
     return slash ? slash + 1 : p;
+}
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+} pop_dat_cookie_t;
+
+static ssize_t pop_dat_cookie_read(void *c, char *buf, size_t n)
+{
+    pop_dat_cookie_t *ck = (pop_dat_cookie_t *)c;
+    size_t avail = ck->size - ck->pos;
+    if (n > avail) n = avail;
+    memcpy(buf, ck->data + ck->pos, n);
+    ck->pos += n;
+    return (ssize_t)n;
+}
+
+static int pop_dat_cookie_seek(void *c, off_t *offset, int whence)
+{
+    pop_dat_cookie_t *ck = (pop_dat_cookie_t *)c;
+    off_t base;
+    switch (whence) {
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = (off_t)ck->pos; break;
+        case SEEK_END: base = (off_t)ck->size; break;
+        default: return -1;
+    }
+    off_t np = base + *offset;
+    if (np < 0 || (size_t)np > ck->size) return -1;
+    ck->pos = (size_t)np;
+    *offset = np;
+    return 0;
+}
+
+static int pop_dat_cookie_close(void *c)
+{
+    free(c);
+    return 0;
 }
 
 FILE *pop_open_embedded_dat(const char *filename)
@@ -40,12 +86,42 @@ FILE *pop_open_embedded_dat(const char *filename)
     const char *base = pop_basename(filename);
     for (size_t i = 0; i < g_embedded_dats_count; i++) {
         if (strcasecmp(g_embedded_dats[i].name, base) == 0) {
-            size_t size = (size_t)(g_embedded_dats[i].end - g_embedded_dats[i].start);
-            /* fmemopen wants void*; "rb" keeps it read-only so flash is never written. */
-            return fmemopen((void *)g_embedded_dats[i].start, size, "rb");
+            pop_dat_cookie_t *ck = (pop_dat_cookie_t *)malloc(sizeof(*ck));
+            if (ck == NULL) return NULL;
+            ck->data = g_embedded_dats[i].start;
+            ck->size = (size_t)(g_embedded_dats[i].end - g_embedded_dats[i].start);
+            ck->pos = 0;
+            cookie_io_functions_t io = {
+                .read  = pop_dat_cookie_read,
+                .write = NULL,
+                .seek  = pop_dat_cookie_seek,
+                .close = pop_dat_cookie_close,
+            };
+            FILE *fp = fopencookie(ck, "rb", io);
+            if (fp == NULL) free(ck);
+            return fp;
         }
     }
     return NULL;
+}
+
+/* Direct flash access to an embedded DAT: returns 1 and fills out_ptr/out_size
+ * if the named DAT is embedded. The port reads DAT headers, resource tables and
+ * resource bytes straight from this flash pointer (memcpy), bypassing FILE*
+ * seeking entirely (picolibc's fseek on memory streams returns ENOSYS once the
+ * 8-bit heap is fragmented). See open_dat / load_from_opendats_* in seg009.c. */
+int pop_get_embedded_dat(const char *filename, const unsigned char **out_ptr, size_t *out_size)
+{
+    if (filename == NULL) return 0;
+    const char *base = pop_basename(filename);
+    for (size_t i = 0; i < g_embedded_dats_count; i++) {
+        if (strcasecmp(g_embedded_dats[i].name, base) == 0) {
+            *out_ptr = g_embedded_dats[i].start;
+            *out_size = (size_t)(g_embedded_dats[i].end - g_embedded_dats[i].start);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ core */
@@ -82,19 +158,21 @@ SDL_TimerID SDL_AddTimer(Uint32 interval, SDL_TimerCallback callback, void *para
 SDL_bool SDL_RemoveTimer(SDL_TimerID id) { (void)id; return SDL_TRUE; }
 
 /* -------------------------------------------------------------- surfaces */
-/* Screen-buffer pool. SDLPoP keeps persistent full-screen 320x200 surfaces;
- * on the ESP32 each is coerced to 8-bit indexed = 64000 bytes. Desktop SDLPoP
- * uses three (onscreen + overlay + merged), but 3 x 64KB = 192KB leaves the
- * fragmented internal heap unable to satisfy even a 16KB dialog "peel" plus the
- * 32KB game-task stack. This port drops merged_surface (it aliases
- * onscreen_surface_; see init_overlay() in seg009.c) and keeps only two pooled
- * screen buffers (onscreen + overlay = 128KB), freeing a whole 64KB heap region
- * for transients. The blocks are reserved once, up front
- * (pop_screen_pool_init(), called from app_main before the heap fragments),
- * because a late 64KB contiguous request fails even when total free RAM is
- * ample. SDL_CreateRGBSurface hands them out for 320x200 requests. */
-#define POP_SCREEN_BYTES 64000  /* 320 * 200, 8-bit indexed */
-#define POP_POOL_SLOTS   2
+/* Screen-buffer pool. SDLPoP keeps several persistent full-screen surfaces; on
+ * the ESP32 each is coerced to 8-bit indexed. During gameplay two coexist:
+ *   - onscreen_surface_ : 320x200 = 64000 bytes
+ *   - offscreen_surface : 320x192 = 61440 bytes (make_offscreen_buffer(rect_top))
+ * (overlay_surface and merged_surface alias onscreen_surface_ in init_overlay();
+ * the overlay is never displayed in this port, so it costs no RAM.)
+ * A late 64KB contiguous request fails on the fragmented internal heap even when
+ * total free RAM is ample, so both blocks are reserved once, up front
+ * (pop_screen_pool_init(), called from app_main before the heap fragments). Each
+ * slot is a full 64000-byte block; the pool also satisfies the slightly smaller
+ * 61440-byte offscreen buffer from a slot. Transient smaller surfaces
+ * (sprites/font glyphs/small peels) use the general heap. */
+#define POP_SCREEN_BYTES    64000  /* 320 * 200, 8-bit indexed */
+#define POP_SCREEN_POOL_MIN 61440  /* smallest full-screen-ish buffer (320x192) */
+#define POP_POOL_SLOTS      2
 static uint8_t *g_pool_block[POP_POOL_SLOTS];
 static bool     g_pool_used[POP_POOL_SLOTS];
 
@@ -274,9 +352,10 @@ static SDL_Surface *create_surface_impl(int width, int height, int depth,
     {
         size_t nbytes = (size_t)pitch * (size_t)(height > 0 ? height : 1);
         if (nbytes == 0) nbytes = 1;
-        /* Full-screen 320x200 buffers come from the reserved pool to dodge heap
-         * fragmentation; everything else uses the general heap. */
-        if (nbytes == POP_SCREEN_BYTES) {
+        /* Full-screen (and the slightly smaller 320x192 offscreen) buffers come
+         * from the reserved pool to dodge heap fragmentation; everything else
+         * uses the general heap. */
+        if (nbytes >= POP_SCREEN_POOL_MIN && nbytes <= POP_SCREEN_BYTES) {
             s->pixels = pool_take();
             s->pool_backed = (s->pixels != NULL) ? SDL_TRUE : SDL_FALSE;
         }
@@ -304,6 +383,38 @@ static SDL_Surface *create_surface_impl(int width, int height, int depth,
     return s;
 }
 
+/* One static INDEX8 pixel format shared by every flash-backed sprite surface.
+ * These surfaces never own their pixels (flash) or their format, so sharing one
+ * format keeps per-sprite RAM down to just the SDL_Surface header (~64 bytes).
+ * The palette is the shared sprite palette; it is unused for rendering (blits
+ * preserve indices; the global game palette maps to RGB565 at present time), so
+ * its contents don't matter for these surfaces. */
+static SDL_PixelFormat g_flash_format;
+static SDL_bool g_flash_format_ready = SDL_FALSE;
+
+SDL_Surface *pop_make_flash_surface(const void *pixels, int width, int height)
+{
+    if (!g_flash_format_ready) {
+        g_flash_format.format = SDL_PIXELFORMAT_INDEX8;
+        g_flash_format.BitsPerPixel = 8;
+        g_flash_format.BytesPerPixel = 1;
+        g_flash_format.Rmask = g_flash_format.Gmask = g_flash_format.Bmask = g_flash_format.Amask = 0;
+        g_flash_format.palette = shared_sprite_palette();
+        g_flash_format_ready = SDL_TRUE;
+    }
+    SDL_Surface *s = (SDL_Surface *)calloc(1, sizeof(SDL_Surface));
+    if (!s) return NULL;
+    s->format = &g_flash_format;
+    s->w = width;
+    s->h = height;
+    s->pitch = width; /* baked pixels are tightly packed, 1 byte/pixel */
+    s->pixels = (void *)pixels; /* read-only flash; sprites are blit sources only */
+    s->clip_rect.x = 0; s->clip_rect.y = 0; s->clip_rect.w = width; s->clip_rect.h = height;
+    s->refcount = 1;
+    s->flash_backed = SDL_TRUE;
+    return s;
+}
+
 void SDL_FreeSurface(SDL_Surface *surface)
 {
     if (!surface) return;
@@ -311,6 +422,13 @@ void SDL_FreeSurface(SDL_Surface *surface)
      * is too big to decode into RAM; many chtab entries point at it, so freeing
      * it (on level teardown) would double-free. Never free it. */
     if (surface == g_pop_sprite_placeholder) return;
+    /* Flash-backed sprite surfaces share one static format/palette and point at
+     * read-only flash pixels (see pop_sprites.c). Free only the SDL_Surface
+     * struct itself; never touch the shared format or the flash pixels. */
+    if (surface->flash_backed) {
+        free(surface);
+        return;
+    }
     if (surface->format) {
         /* The shared sprite palette is global and reused; never free it. */
         if (surface->format->palette &&
@@ -392,10 +510,78 @@ int SDL_FillRect(SDL_Surface *dst, const SDL_Rect *rect, Uint32 color)
     return 0;
 }
 
-/* P0: blits are no-ops (nothing is displayed yet). Real indexed blit lands in P3. */
+/* Real INDEX8 -> INDEX8 blit. Every surface in the ESP port is 8-bit indexed
+ * (sprites are flash-backed INDEX8; screen buffers are INDEX8), so a blit is an
+ * index-preserving row copy. Honors the source colorkey (transparent index) and
+ * the destination clip rect, and adjusts dstrect to the region actually written
+ * (matching SDL2 semantics that callers like method_1_blit_rect rely on). */
 int SDL_BlitSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, SDL_Rect *dstrect)
 {
-    (void)src; (void)srcrect; (void)dst; (void)dstrect;
+    if (!src || !dst || !src->pixels || !dst->pixels) return -1;
+
+    int sx = 0, sy = 0, sw = src->w, sh = src->h;
+    if (srcrect) { sx = srcrect->x; sy = srcrect->y; sw = srcrect->w; sh = srcrect->h; }
+    int dx = (dstrect) ? dstrect->x : 0;
+    int dy = (dstrect) ? dstrect->y : 0;
+
+    /* Clip the source rect to the source surface. */
+    if (sx < 0) { dx -= sx; sw += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; sh += sy; sy = 0; }
+    if (sx + sw > src->w) sw = src->w - sx;
+    if (sy + sh > src->h) sh = src->h - sy;
+
+    /* Clip the destination against dst->clip_rect (and the surface bounds). */
+    int cx0 = dst->clip_rect.x, cy0 = dst->clip_rect.y;
+    int cx1 = cx0 + dst->clip_rect.w, cy1 = cy0 + dst->clip_rect.h;
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > dst->w) cx1 = dst->w;
+    if (cy1 > dst->h) cy1 = dst->h;
+    if (dx < cx0) { int d = cx0 - dx; sx += d; sw -= d; dx = cx0; }
+    if (dy < cy0) { int d = cy0 - dy; sy += d; sh -= d; dy = cy0; }
+    if (dx + sw > cx1) sw = cx1 - dx;
+    if (dy + sh > cy1) sh = cy1 - dy;
+
+    if (sw <= 0 || sh <= 0) {
+        if (dstrect) { dstrect->w = 0; dstrect->h = 0; }
+        return 0;
+    }
+
+    int sbpp = src->format ? src->format->BytesPerPixel : 1;
+    int dbpp = dst->format ? dst->format->BytesPerPixel : 1;
+    const Uint8 *srow = (const Uint8 *)src->pixels + (size_t)sy * src->pitch + (size_t)sx * sbpp;
+    Uint8 *drow = (Uint8 *)dst->pixels + (size_t)dy * dst->pitch + (size_t)dx * dbpp;
+
+    if (sbpp == 1 && dbpp == 1) {
+        if (src->has_colorkey) {
+            Uint8 key = (Uint8)src->colorkey;
+            for (int y = 0; y < sh; y++) {
+                const Uint8 *s = srow;
+                Uint8 *d = drow;
+                for (int x = 0; x < sw; x++) {
+                    Uint8 v = s[x];
+                    if (v != key) d[x] = v;
+                }
+                srow += src->pitch;
+                drow += dst->pitch;
+            }
+        } else {
+            for (int y = 0; y < sh; y++) {
+                memcpy(drow, srow, (size_t)sw);
+                srow += src->pitch;
+                drow += dst->pitch;
+            }
+        }
+    } else if (sbpp == dbpp) {
+        /* Non-indexed same-depth copy (rare on ESP: e.g. peel save/restore). */
+        for (int y = 0; y < sh; y++) {
+            memcpy(drow, srow, (size_t)sw * sbpp);
+            srow += src->pitch;
+            drow += dst->pitch;
+        }
+    }
+
+    if (dstrect) { dstrect->x = dx; dstrect->y = dy; dstrect->w = sw; dstrect->h = sh; }
     return 0;
 }
 int SDL_BlitScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, SDL_Rect *dstrect)

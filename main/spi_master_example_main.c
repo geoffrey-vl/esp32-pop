@@ -44,8 +44,11 @@
 #define PIN_NUM_DC   21 // D21
 #define PIN_NUM_RST  22 // D22
 //Backlight is hard-wired on and not driven by the MCU. Set to a real GPIO to
-//re-enable MCU control; leave as GPIO_NUM_NC (-1) to compile out the backlight code.
-#define PIN_NUM_BCKL GPIO_NUM_NC
+//re-enable MCU control; leave as -1 to compile out the backlight code.
+//NOTE: this must be a plain integer literal (not GPIO_NUM_NC), because the
+//`#if PIN_NUM_BCKL >= 0` guards below are evaluated by the preprocessor, which
+//treats unknown identifiers as 0 and would wrongly keep the backlight code.
+#define PIN_NUM_BCKL -1
 
 #define LCD_BK_LIGHT_ON_LEVEL   0
 
@@ -367,8 +370,10 @@ static void display_image(spi_device_handle_t spi, const dat_image_t *img)
 }
 
 //Decode a 16-color image resource from a DAT file and show it top-left, blanking the rest.
-//Decode a 16-color image resource from a DAT file and show it top-left, blanking the rest.
 //The palette is discovered automatically from the DAT (see read_dat_palette_for).
+//Kept as a debug helper (the SDLPoP engine now drives the display); mark it
+//unused so -Werror=unused-function does not fail the build.
+__attribute__((unused))
 static void show_dat_image(spi_device_handle_t spi, const char *dat_name, int16_t id)
 {
     static const char *TAG = "dat_image";
@@ -414,6 +419,98 @@ static void show_dat_image(spi_device_handle_t spi, const char *dat_name, int16_
 
     display_image(spi, &img);
     dat_image_free(&img);
+}
+
+/* SPI handle and pre-allocated DMA line buffers used by pop_present_indexed().
+ * Allocated once at startup so the per-frame present path never allocates. */
+static spi_device_handle_t s_pop_spi = NULL;
+static uint16_t *s_pop_lines[2] = { NULL, NULL };
+
+/* Present a 320x200 INDEX8 SDLPoP frame to the LCD, letterboxed vertically in
+ * the 320x240 panel, mapping palette indices to RGB565 via the engine's current
+ * VGA palette (6-bit channels). Reuses two pre-allocated DMA line buffers so the
+ * per-frame path allocates nothing. */
+extern unsigned char palette[]; /* rgb_type palette[256], packed r,g,b bytes (0..63) */
+
+void pop_present_indexed(const unsigned char *pix, int w, int h, int pitch)
+{
+    if (s_pop_spi == NULL || s_pop_lines[0] == NULL || pix == NULL) return;
+
+    /* Build an index -> RGB565 (byte-swapped for the panel) lookup. */
+    uint16_t lut[256];
+    for (int i = 0; i < 256; i++) {
+        uint16_t r5 = (uint16_t)((palette[i * 3 + 0] << 2) >> 3);
+        uint16_t g6 = (uint16_t)((palette[i * 3 + 1] << 2) >> 2);
+        uint16_t b5 = (uint16_t)((palette[i * 3 + 2] << 2) >> 3);
+        uint16_t v = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+        lut[i] = (uint16_t)((v >> 8) | (v << 8));
+    }
+
+    int y_off = (LCD_HEIGHT - h) / 2; /* center 200 rows in 240: 20px top/bottom */
+    int cw = (w < LCD_WIDTH) ? w : LCD_WIDTH;
+    int sending = -1;
+    int calc = 0;
+    for (int y = 0; y < LCD_HEIGHT; y += PARALLEL_LINES) {
+        uint16_t *dst = s_pop_lines[calc];
+        for (int r = 0; r < PARALLEL_LINES; r++) {
+            int sy = y + r - y_off;
+            uint16_t *drow = dst + r * LCD_WIDTH;
+            if (sy >= 0 && sy < h) {
+                const unsigned char *srow = pix + (size_t)sy * pitch;
+                for (int x = 0; x < cw; x++) drow[x] = lut[srow[x]];
+                for (int x = cw; x < LCD_WIDTH; x++) drow[x] = 0;
+            } else {
+                memset(drow, 0, LCD_WIDTH * sizeof(uint16_t)); /* black bar */
+            }
+        }
+        if (sending != -1) send_line_finish(s_pop_spi);
+        sending = calc;
+        calc = (calc == 1) ? 0 : 1;
+        send_lines(s_pop_spi, y, s_pop_lines[sending]);
+    }
+    send_line_finish(s_pop_spi);
+}
+
+/* --- Player input (P5) ---------------------------------------------------
+ * Five momentary push-buttons wired active-low from a GPIO to GND, using the
+ * ESP32 internal pull-ups. The engine polls pop_read_buttons() from its ESP
+ * process_events() path and maps the bits onto SDL arrow/shift scancodes. */
+#define POP_BTN_LEFT   (1u << 0)
+#define POP_BTN_RIGHT  (1u << 1)
+#define POP_BTN_UP     (1u << 2)
+#define POP_BTN_DOWN   (1u << 3)
+#define POP_BTN_SHIFT  (1u << 4)
+
+#define POP_PIN_LEFT   GPIO_NUM_32
+#define POP_PIN_RIGHT  GPIO_NUM_33
+#define POP_PIN_UP     GPIO_NUM_25
+#define POP_PIN_DOWN   GPIO_NUM_26
+#define POP_PIN_SHIFT  GPIO_NUM_27
+
+void pop_input_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << POP_PIN_LEFT) | (1ULL << POP_PIN_RIGHT) |
+                        (1ULL << POP_PIN_UP)   | (1ULL << POP_PIN_DOWN)  |
+                        (1ULL << POP_PIN_SHIFT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+}
+
+/* Return a bitmask of currently-pressed buttons (active-low: 0 == pressed). */
+unsigned int pop_read_buttons(void)
+{
+    unsigned int m = 0;
+    if (gpio_get_level(POP_PIN_LEFT)  == 0) m |= POP_BTN_LEFT;
+    if (gpio_get_level(POP_PIN_RIGHT) == 0) m |= POP_BTN_RIGHT;
+    if (gpio_get_level(POP_PIN_UP)    == 0) m |= POP_BTN_UP;
+    if (gpio_get_level(POP_PIN_DOWN)  == 0) m |= POP_BTN_DOWN;
+    if (gpio_get_level(POP_PIN_SHIFT) == 0) m |= POP_BTN_SHIFT;
+    return m;
 }
 
 /* --- SDLPoP engine bridge (implemented in pop_glue.c) --- */
@@ -480,6 +577,14 @@ void app_main(void)
      * byte-addressable RAM; later they cannot, due to fragmentation. */
     pop_screen_pool_init();
 
+    /* Parse the embedded pre-decoded sprite blob so the engine can back its
+     * chtab image_type surfaces with flash pixels (P2). */
+    extern void pop_sprites_init(void);
+    pop_sprites_init();
+
+    /* Configure the five gameplay push-buttons (P5). */
+    pop_input_init();
+
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
         .mosi_io_num = PIN_NUM_MOSI,
@@ -507,6 +612,17 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
     //Initialize the LCD
     lcd_init(spi);
+
+    /* Keep the SPI handle and reserve the two DMA line buffers the present path
+     * reuses every frame (P4). Do it now, before the engine task fragments the
+     * heap, so the DMA-capable RAM is available. */
+    s_pop_spi = spi;
+    for (int i = 0; i < 2; i++) {
+        s_pop_lines[i] = spi_bus_dma_memory_alloc(LCD_HOST,
+                              LCD_WIDTH * PARALLEL_LINES * sizeof(uint16_t),
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        assert(s_pop_lines[i] != NULL);
+    }
 
     /* Start the SDLPoP engine and a monitor. LCD present is still a no-op in P1;
      * the existing TITLE.DAT viewer is retired now that the engine drives things. */
