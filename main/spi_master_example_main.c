@@ -595,9 +595,9 @@ void app_main(void)
     };
     spi_device_interface_config_t devcfg = {
 #ifdef CONFIG_LCD_OVERCLOCK
-        .clock_speed_hz = 26 * 1000 * 1000,     //Clock out at 26 MHz
+        .clock_speed_hz = 40 * 1000 * 1000,     //Clock out at 40 MHz (needs clean/short wiring)
 #else
-        .clock_speed_hz = 10 * 1000 * 1000,     //Clock out at 10 MHz
+        .clock_speed_hz = 26 * 1000 * 1000,     //Clock out at 26 MHz (~48ms/frame, fits the ~12fps game tick)
 #endif
         .mode = 0,                              //SPI mode 0
         .spics_io_num = PIN_NUM_CS,             //CS pin
