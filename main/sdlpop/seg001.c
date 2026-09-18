@@ -581,6 +581,18 @@ void end_sequence() {
 	is_ending_sequence = true; // added (fix being able to pause the game during the end sequence)
 	load_opt_sounds(sound_56_ending_music, sound_56_ending_music); // winning theme
 	play_sound_from_buffer(sound_pointers[sound_56_ending_music]); // winning theme
+#ifdef ESP_PLATFORM
+	// ESP32 port: the princess-hug ending cutscene (end_sequence_anim) has just
+	// played. Skip the title-image finale + Hall of Fame that follows: it needs
+	// a second full offscreen buffer and the whole TITLE.DAT image set this
+	// board can't spare, and the HOF name entry is a menu (out of scope). Just
+	// restart the game, matching the skipped title sequence in start_game().
+	(void)rect; (void)hof_index; (void)i; (void)color; (void)bgcolor;
+	is_ending_sequence = false;
+	start_level = -1;
+	start_game();
+	return;
+#endif
 	if(offscreen_surface) free_surface(offscreen_surface); // missing in original
 	offscreen_surface = make_offscreen_buffer(&screen_rect);
 	load_title_images(0);

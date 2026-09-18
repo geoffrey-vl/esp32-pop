@@ -231,19 +231,6 @@ void start_game() {
 		return;
 	}
 
-#ifdef ESP_PLATFORM
-	// The ESP32 port has no title sequence and no menu (per project scope): the
-	// intro loads a second offscreen buffer and the full set of title images,
-	// which this hardware can't spare, and there is no display/input wired to
-	// navigate a menu yet. Load the first playable level directly so the game
-	// simulation runs immediately.
-	{
-		int level_number = (start_level >= 0) ? start_level : custom->first_level;
-		init_game(level_number);
-		return;
-	}
-#endif
-
 	if (start_level < 0) {
 		show_title();
 	} else {

@@ -401,6 +401,18 @@ static const chtab_cfg_t g_cfgs[] = {
     { "VDUNGEON.DAT", "VDUNGEON.DAT", 360, 1 << 6, 0 }, /* dungeon walls (VGA) */
     { "VPALACE.DAT",  "VPALACE.DAT",  200, 1 << 5, 0 }, /* palace environment (VGA) */
     { "VPALACE.DAT",  "VPALACE.DAT",  360, 1 << 6, 0 }, /* palace walls (VGA) */
+    /* Story cutscene graphics (princess/vizier/mouse/kid + princess room),
+     * loaded by load_intro() from PV.DAT. Chtab ids 3,4,8,9. */
+    { "PV.DAT",       "PV.DAT",       800, 1 << 9,  0 }, /* princess in story (chtab 3) */
+    { "PV.DAT",       "PV.DAT",       850, 1 << 10, 0 }, /* jaffar/princess in cutscenes (chtab 4, normal) */
+    { "PV.DAT",       "PV.DAT",       900, 1 << 10, 0 }, /* princess in cutscenes (chtab 4, ending/expired) */
+    { "PV.DAT",       "PV.DAT",       950, 1 << 13, 0 }, /* princess room bg (chtab 8) */
+    { "PV.DAT",       "PV.DAT",       980, 1 << 14, 0 }, /* princess bed (chtab 9) */
+    /* Opening sequence (show_title): title logos + story text frame, loaded by
+     * load_title_images() from TITLE.DAT. chtab_title40 (res 40) and
+     * chtab_title50 (res 50). */
+    { "TITLE.DAT",    "TITLE.DAT",     40, 1 << 11, 0 }, /* story text frame + text lines (chtab_title40) */
+    { "TITLE.DAT",    "TITLE.DAT",     50, 1 << 12, 0 }, /* Broderbund/PoP/Mechner logos (chtab_title50) */
 };
 #define N_CFGS ((int)(sizeof(g_cfgs) / sizeof(g_cfgs[0])))
 
