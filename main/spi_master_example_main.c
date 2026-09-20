@@ -502,6 +502,7 @@ void pop_present_indexed(const unsigned char *pix, int w, int h, int pitch)
 #define POP_BTN_UP     (1u << 2)
 #define POP_BTN_DOWN   (1u << 3)
 #define POP_BTN_SHIFT  (1u << 4)
+#define POP_BTN_PAUSE  (1u << 5)
 
 #define POP_PIN_LEFT   GPIO_NUM_32
 #define POP_PIN_RIGHT  GPIO_NUM_33
@@ -509,12 +510,23 @@ void pop_present_indexed(const unsigned char *pix, int w, int h, int pitch)
 #define POP_PIN_DOWN   GPIO_NUM_27   // moved from 26: GPIO26 is now the audio DAC output
 #define POP_PIN_SHIFT  GPIO_NUM_13   // moved from 27
 
+// Optional sixth button that pauses/resumes the game (maps to the Esc key).
+// Disabled by default: set this to a spare GPIO to enable it. Must be a plain
+// integer literal (not GPIO_NUM_NC), because the `#if POP_PIN_PAUSE >= 0`
+// guards below are evaluated by the preprocessor. Wire it active-low to GND
+// like the other buttons (the internal pull-up is enabled).
+#define POP_PIN_PAUSE  -1
+
 void pop_input_init(void)
 {
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << POP_PIN_LEFT) | (1ULL << POP_PIN_RIGHT) |
                         (1ULL << POP_PIN_UP)   | (1ULL << POP_PIN_DOWN)  |
-                        (1ULL << POP_PIN_SHIFT),
+                        (1ULL << POP_PIN_SHIFT)
+#if POP_PIN_PAUSE >= 0
+                        | (1ULL << POP_PIN_PAUSE)
+#endif
+                        ,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -532,6 +544,9 @@ unsigned int pop_read_buttons(void)
     if (gpio_get_level(POP_PIN_UP)    == 0) m |= POP_BTN_UP;
     if (gpio_get_level(POP_PIN_DOWN)  == 0) m |= POP_BTN_DOWN;
     if (gpio_get_level(POP_PIN_SHIFT) == 0) m |= POP_BTN_SHIFT;
+#if POP_PIN_PAUSE >= 0
+    if (gpio_get_level(POP_PIN_PAUSE) == 0) m |= POP_BTN_PAUSE;
+#endif
     return m;
 }
 

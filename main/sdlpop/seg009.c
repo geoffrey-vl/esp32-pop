@@ -4227,6 +4227,7 @@ extern unsigned int pop_read_buttons(void); // bitmask, see spi_master_example_m
 #define POP_BTN_UP     (1u << 2)
 #define POP_BTN_DOWN   (1u << 3)
 #define POP_BTN_SHIFT  (1u << 4)
+#define POP_BTN_PAUSE  (1u << 5)
 
 static void pop_esp_apply_button(unsigned int now, unsigned int mask, int scancode, int is_control_key) {
 	if (now & mask) {
@@ -4250,6 +4251,9 @@ static void pop_esp_poll_input(void) {
 	pop_esp_apply_button(now, POP_BTN_UP,    SDL_SCANCODE_UP,     0);
 	pop_esp_apply_button(now, POP_BTN_DOWN,  SDL_SCANCODE_DOWN,   0);
 	pop_esp_apply_button(now, POP_BTN_SHIFT, SDL_SCANCODE_LSHIFT, 1);
+	// Optional pause button -> Esc: process_key() sets is_paused, and the next
+	// button press resumes (USE_MENU is off, so there is no pause menu to walk).
+	pop_esp_apply_button(now, POP_BTN_PAUSE, SDL_SCANCODE_ESCAPE, 0);
 }
 #endif // ESP_PLATFORM
 

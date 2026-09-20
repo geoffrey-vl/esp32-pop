@@ -56,6 +56,19 @@ pull-ups, so a pressed button reads LOW; no external resistors are needed.
 > Avoid the GPIOs already used by the LCD (5, 18, 19, 21, 22, 23) and the
 > input-only pins 34–39 (they have no internal pull-up).
 
+**Optional pause button**
+
+A sixth momentary button can pause/resume the game (it maps to the Esc key: the
+first press pauses and shows `GAME PAUSED`, any button press resumes). It is
+**disabled by default**. To enable it, set `POP_PIN_PAUSE` in
+`main/spi_master_example_main.c` from `-1` to a spare GPIO, then wire that GPIO
+to **GND** through the button like the others (the internal pull-up is enabled).
+
+| Button | ESP32 GPIO | In-game action |
+| ------ | ---------- | -------------- |
+| Pause | *(unset, `POP_PIN_PAUSE = -1`)* | Pause / resume the game |
+
+
 **Full wiring diagram**
 
 Drawn for a common 30-pin **ESP32 DevKit v1** (DOIT/WROOM) board. The five
