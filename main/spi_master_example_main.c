@@ -563,6 +563,7 @@ extern int pop_current_level(void);
 /* SDLPoP command-line globals (data.c); the engine expects at least argv[0]. */
 extern int g_argc;
 extern char **g_argv;
+
 static char *s_pop_argv[] = { "pop", NULL };
 
 /* Reserve the three full-screen 320x200 buffers up front (in sdlpop_shim.c),
@@ -575,7 +576,7 @@ static TaskHandle_t s_pop_game_task = NULL;
 
 static void pop_game_task(void *arg){
     (void)arg;
-    g_argc = 1;
+    g_argc = (int)(sizeof(s_pop_argv) / sizeof(s_pop_argv[0])) - 1;
     g_argv = s_pop_argv;
 #if POP_AUDIO_SELFTEST
     ESP_LOGI("pop_port", "[P7] running audio self-test (no graphics)...");

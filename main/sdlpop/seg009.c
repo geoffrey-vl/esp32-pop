@@ -1368,6 +1368,46 @@ static void load_font_character_offsets(rawfont_type* data) {
 	}
 }
 
+#ifdef ESP_PLATFORM
+// ESP32 port: decode one built-in font glyph into a real 8-bit surface.
+// decode_image() deliberately returns a shared 1x1 placeholder on the ESP32
+// (level/cutscene sprites are rendered straight from flash, never decoded into
+// RAM), but the font is the small glyph data embedded in the firmware and must
+// produce genuine bitmaps or all draw_text() output is invisible. method_3_blit_mono()
+// stamps the current text colour wherever a glyph pixel is non-zero, so only the
+// decoded index bytes are needed (index 0 = transparent); no colour-key required.
+// Zero-width glyphs (e.g. space) still get a valid surface so their advance width
+// (space_between_chars + image->w) is honoured by draw_text_character().
+static image_type* pop_decode_font_glyph(image_data_type* image_data) {
+	int height = SDL_SwapLE16(image_data->height);
+	if (height == 0) return NULL;
+	int width = SDL_SwapLE16(image_data->width);
+	image_type* image = SDL_CreateRGBSurface(0, width, height, 8, 0, 0, 0, 0);
+	if (image == NULL) return NULL;
+	if (width > 0) {
+		int flags = SDL_SwapLE16(image_data->flags);
+		int depth = ((flags >> 12) & 7) + 1;
+		int cmeth = (flags >> 8) & 0x0F;
+		int stride = calc_stride(image_data);
+		int dest_size = stride * height;
+		byte* dest = (byte*) malloc(dest_size);
+		if (dest != NULL) {
+			memset(dest, 0, dest_size);
+			decompr_img(dest, image_data, dest_size, cmeth, stride);
+			byte* image_8bpp = conv_to_8bpp(dest, width, height, stride, depth);
+			free(dest);
+			if (image_8bpp != NULL) {
+				for (int y = 0; y < height; ++y) {
+					memcpy((byte*)image->pixels + y*image->pitch, image_8bpp + y*width, width);
+				}
+				free(image_8bpp);
+			}
+		}
+	}
+	return image;
+}
+#endif
+
 font_type load_font_from_data(/*const*/ rawfont_type* data) {
 	font_type font;
 	font.first_char = data->first_char;
@@ -1382,20 +1422,30 @@ font_type load_font_from_data(/*const*/ rawfont_type* data) {
 		load_font_character_offsets(data);
 	}
 	chtab_type* chtab = malloc(sizeof(chtab_type) + sizeof(image_type*) * n_chars);
+#ifndef ESP_PLATFORM
 	// Make a dummy palette for decode_image().
 	dat_pal_type dat_pal;
 	memset(&dat_pal, 0, sizeof(dat_pal));
 	dat_pal.vga[1].r = dat_pal.vga[1].g = dat_pal.vga[1].b = 0x3F; // white
+#endif
 	for (int index = 0, chr = data->first_char; chr <= data->last_char; ++index, ++chr) {
 		/*const*/ image_data_type* image_data = (/*const*/ image_data_type*)((/*const*/ byte*)data + SDL_SwapLE16(data->offsets[index]));
 		//image_data->flags=0;
 		if (image_data->height == SDL_SwapLE16(0)) image_data->height = SDL_SwapLE16(1); // HACK: decode_image() returns NULL if height==0.
+#ifdef ESP_PLATFORM
+		// decode_image() hands back a shared 1x1 placeholder on the ESP32, which
+		// would make every glyph (and thus all draw_text output) invisible. Decode
+		// the embedded font glyph into a real surface instead. method_3_blit_mono()
+		// ignores the colour key on this port, so none is set.
+		chtab->images[index] = pop_decode_font_glyph(image_data);
+#else
 		image_type* image;
 		chtab->images[index] = image = decode_image(image_data, &dat_pal);
 		if (SDL_SetColorKey(image, SDL_TRUE, 0) != 0) {
 			sdlperror("load_font_from_data: SDL_SetColorKey");
 			quit(1);
 		}
+#endif
 	}
 	font.chtab = chtab;
 	return font;

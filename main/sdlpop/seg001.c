@@ -583,11 +583,38 @@ void end_sequence() {
 	play_sound_from_buffer(sound_pointers[sound_56_ending_music]); // winning theme
 #ifdef ESP_PLATFORM
 	// ESP32 port: the princess-hug ending cutscene (end_sequence_anim) has just
-	// played. Skip the title-image finale + Hall of Fame that follows: it needs
-	// a second full offscreen buffer and the whole TITLE.DAT image set this
-	// board can't spare, and the HOF name entry is a menu (out of scope). Just
-	// restart the game, matching the skipped title sequence in start_game().
+	// played. The desktop now shows a title-image finale and an interactive
+	// Hall-of-Fame name entry backed by PRINCE.HOF. We keep the Hall of Fame
+	// screen itself (its images live in the flash-baked title40/title50 chtabs,
+	// and this is the same draw path show_title() already uses on the device)
+	// but drop the two parts this board can't do: the keyboard name entry (there
+	// is no keyboard) and the PRINCE.HOF persistence (there is no filesystem).
+	// Instead we show a single fixed entry with the player's completion time,
+	// then restart the game.
 	(void)rect; (void)hof_index; (void)i; (void)color; (void)bgcolor;
+	hof_count = 1;
+	snprintf(hof[0].name, sizeof(hof[0].name), "ESP32-POP");
+	hof[0].min = rem_min;   // show_hof() prints (min - 1):(tick / 12)
+	hof[0].tick = rem_tick;
+
+	if (offscreen_surface) free_surface(offscreen_surface);
+	offscreen_surface = make_offscreen_buffer(&screen_rect);
+	load_title_images(0);
+	current_target_surface = offscreen_surface;
+	draw_full_image(STORY_FRAME);
+	draw_full_image(HOF_POP);
+	show_hof();
+	transition_ltr();
+
+	current_target_surface = onscreen_surface_;
+	pop_wait(timer_0, 6000); // hold ~6 s on the Hall of Fame; any button skips it
+
+	fade_out_2(0x1000);
+	free_surface(offscreen_surface);
+	offscreen_surface = NULL;
+	release_title_images();
+
+	hof_count = 0; // consumed; don't re-show it during the title sequence
 	is_ending_sequence = false;
 	start_level = -1;
 	start_game();
@@ -747,7 +774,6 @@ void show_hof() {
 	char time_text[12];
 	for (short index = 0; index < hof_count; ++index) {
 
-		printf("index = %d, hof[index].min = %d, hof[index].tick = %d\n", index, hof[index].min, hof[index].tick);
 #ifdef ALLOW_INFINITE_TIME
 		int minutes, seconds;
 		if (hof[index].min > 0) {
