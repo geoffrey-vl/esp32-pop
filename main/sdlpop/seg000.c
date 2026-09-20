@@ -581,7 +581,15 @@ int process_key() {
 		}
 	}
 	// If the Kid died, Enter or Shift will restart the level.
-	if (rem_min != 0 && Kid.alive > 6 && (control_shift || key == SDL_SCANCODE_RETURN)) {
+	// On the ESP port there is no Enter key and only five buttons, so honour the
+	// on-screen "Press Button to Continue" prompt literally: any button press
+	// (an arrow sets `key`, Shift sets control_shift) restarts once the Kid is
+	// dead. This is gated on Kid.alive > 6 so it never affects normal play.
+	if (rem_min != 0 && Kid.alive > 6 && (control_shift || key == SDL_SCANCODE_RETURN
+#ifdef ESP_PLATFORM
+		|| key != 0
+#endif
+	)) {
 		key = SDL_SCANCODE_A | WITH_CTRL; // Ctrl+A
 	}
 #ifdef USE_REPLAY
@@ -1622,10 +1630,16 @@ void fix_sound_priorities() {
 void play_sound(int sound_id) {
 	//printf("Would play sound %d\n", sound_id);
 	if (next_sound < 0 || sound_prio_table[sound_id] <= sound_prio_table[next_sound]) {
+#ifdef ESP_PLATFORM
+		// Sounds are loaded on demand in play_next_sound(), so there is no
+		// preloaded buffer to inspect here; just queue the top-priority request.
+		next_sound = sound_id;
+#else
 		if (NULL == sound_pointers[sound_id]) return;
 		if (sound_pcspeaker_exists[sound_id] != 0 || sound_pointers[sound_id]->type != sound_speaker) {
 			next_sound = sound_id;
 		}
+#endif
 	}
 }
 
@@ -1636,7 +1650,11 @@ void play_next_sound() {
 			(sound_interruptible[current_sound] != 0 && sound_prio_table[next_sound] <= sound_prio_table[current_sound])
 		) {
 			current_sound = next_sound;
+#ifdef ESP_PLATFORM
+			play_sound_from_buffer(pop_ensure_sound(current_sound));
+#else
 			play_sound_from_buffer(sound_pointers[current_sound]);
+#endif
 		}
 	}
 	next_sound = -1;
@@ -1671,6 +1689,10 @@ void free_all_chtabs_from(int first) {
 
 // seg009:12EF
 void load_one_optgraf(chtab_type* chtab_ptr,dat_pal_type* pal_ptr,int base_id,int min_index,int max_index) {
+	// ESP32 port: the environment chtab can be NULL if load_sprites_from_file()
+	// ran out of 8-bit heap. Skip the optional graphics rather than dereferencing
+	// a NULL chtab (which faulted in ROM memcpy).
+	if (chtab_ptr == NULL) return;
 	for (short index = min_index; index <= max_index; ++index) {
 		image_type* image = load_image(base_id + index + 1, pal_ptr);
 		if (image != NULL) chtab_ptr->images[index] = image;

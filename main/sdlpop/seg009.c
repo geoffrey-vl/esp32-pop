@@ -34,6 +34,10 @@ The authors of this program may be contacted at https://forum.princed.org
 #include <proto/dos.h>
 #endif
 
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
+
 // Most functions in this file are different from those in the original game.
 
 void sdlperror(const char* header) {
@@ -81,6 +85,11 @@ void find_exe_dir(void) {
 void find_home_dir(void) {
 	if (found_home_dir) return;
 	const char* home_path = getenv("HOME");
+	if (home_path == NULL) {
+		// No HOME in the environment (e.g. on the ESP32 port): skip the home dir.
+		home_dir[0] = '\0';
+		return;
+	}
 	snprintf_check(home_dir, POP_MAX_PATH - 1, "%s/.%s", home_path, POP_DIR_NAME);
 	if(file_exists(home_dir))
 		found_home_dir = true;
@@ -442,6 +451,40 @@ static FILE* open_dat_from_root_or_data_dir(const char* filename) {
 
 int showmessage(char* text,int arg_4,void* arg_0);
 
+#ifdef ESP_PLATFORM
+// The only heap allocation open_dat() makes on ESP is this ~280-byte header
+// (the resource table and resource bytes live in flash). Under level-load heap
+// pressure the fragmented 8-bit heap can have its largest free block down to a
+// few hundred bytes, so even this small calloc fails — which silently breaks
+// LEVELS.DAT (the level then never loads) and every sound. Serve headers from a
+// fixed .bss pool so open_dat can never be starved by fragmentation. Only a
+// handful of DATs are open at once (level + graphics + up to 5 sound DATs), so
+// 12 slots is ample; a pool miss falls back to calloc().
+#define POP_DAT_POOL_N 12
+static dat_type g_dat_pool[POP_DAT_POOL_N];
+static bool g_dat_pool_used[POP_DAT_POOL_N];
+
+static dat_type* pop_dat_pool_alloc(void) {
+	for (int i = 0; i < POP_DAT_POOL_N; ++i) {
+		if (!g_dat_pool_used[i]) {
+			g_dat_pool_used[i] = true;
+			memset(&g_dat_pool[i], 0, sizeof(dat_type));
+			return &g_dat_pool[i];
+		}
+	}
+	return NULL;
+}
+
+// Returns true if the pointer belonged to the pool (and was released).
+static bool pop_dat_pool_free(dat_type* p) {
+	if (p >= g_dat_pool && p < g_dat_pool + POP_DAT_POOL_N) {
+		g_dat_pool_used[p - g_dat_pool] = false;
+		return true;
+	}
+	return false;
+}
+#endif
+
 // seg009:0F58
 dat_type* open_dat(const char* filename, int optional) {
 	FILE* fp = NULL;
@@ -466,7 +509,21 @@ dat_type* open_dat(const char* filename, int optional) {
 	dat_header_type dat_header;
 	dat_table_type* dat_table = NULL;
 
+#ifdef ESP_PLATFORM
+	dat_type* pointer = pop_dat_pool_alloc();
+#else
 	dat_type* pointer = (dat_type*) calloc(1, sizeof(dat_type));
+#endif
+	if (pointer == NULL) {
+		// Out of memory (or a corrupted heap free-list). Don't dereference NULL
+		// (which faults writing to offset 8, the filename field); fail loudly.
+		printf("open_dat(%s): calloc(dat_type) FAILED (free=%u largest=%u)\n",
+		       filename ? filename : "(null)",
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+		if (fp != NULL) fclose(fp);
+		return NULL;
+	}
 	snprintf_check(pointer->filename, sizeof(pointer->filename), "%s", filename);
 	pointer->next_dat = dat_chain_ptr;
 	dat_chain_ptr = pointer;
@@ -599,34 +656,68 @@ chtab_type* load_sprites_from_file(int resource,int palette_bits, int quit_on_er
 	}
 
 	int n_images = shpl->n_images;
-	size_t alloc_size = sizeof(chtab_type) + sizeof(void *) * n_images;
+#ifdef ESP_PLATFORM
+	extern int pop_sprites_find(const char*, int);
+	extern const unsigned char* pop_sprites_image(int, int, int*, int*);
+	extern void pop_fill_flash_surface(SDL_Surface*, const void*, int, int);
+	extern image_type* g_pop_sprite_placeholder;
+	// Look the baked chtab up now so we can size ONE contiguous header block for
+	// all of its sprites and append it to the chtab allocation below. Packing the
+	// headers this way removes ~n_images individual mallocs and keeps the level's
+	// sprite headers from fragmenting the tiny 8-bit heap.
+	int esp_fidx = pop_sprites_find(dat_chain_ptr->filename, resource);
+	size_t esp_hdr_bytes = (esp_fidx >= 0) ? (size_t)n_images * sizeof(SDL_Surface) : 0;
+#else
+	size_t esp_hdr_bytes = 0;
+#endif
+	size_t alloc_size = sizeof(chtab_type) + sizeof(void *) * n_images + esp_hdr_bytes;
 	chtab_type* chtab = (chtab_type*) malloc(alloc_size);
+	if (chtab == NULL) {
+		// Out of heap (common on ESP32 when a level's chtabs are loaded with the
+		// title/cutscene surfaces still resident). Fail gracefully instead of
+		// memset()'ing a NULL pointer, which faults in ROM memset (StoreProhibited).
+		// Report the byte-addressable (8-bit) heap: MALLOC_CAP_INTERNAL alone is
+		// misleading here because it counts the 64 KB of 32-bit-only IRAM that
+		// pixel/struct callocs can never use.
+		printf("load_sprites_from_file: OOM for chtab res %d (%d images) free8=%u largest8=%u\n",
+		       resource, n_images,
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+		free(shpl);
+		return NULL;
+	}
 	memset(chtab, 0, alloc_size);
 	chtab->n_images = n_images;
 #ifdef ESP_PLATFORM
 	// ESP32 port (P2): sprites are pre-decoded to flash (assets/pop_sprites.bin)
-	// and rendered straight from there; we never decode into RAM. Look up the
-	// baked chtab by the DAT file just opened + base resource and back each
-	// image_type with flash pixels. The shpl palette obtained above is still
-	// applied via set_loaded_palette() below, exactly as on desktop.
+	// and rendered straight from there; we never decode into RAM. Back each image
+	// with a header carved from the contiguous block appended above (baked chtabs)
+	// or with the shared placeholder (unbaked chtabs). The shpl palette obtained
+	// above is still applied via set_loaded_palette() below, as on desktop.
 	{
-		extern int pop_sprites_find(const char*, int);
-		extern const unsigned char* pop_sprites_image(int, int, int*, int*);
-		extern SDL_Surface* pop_make_flash_surface(const void*, int, int);
-		extern image_type* g_pop_sprite_placeholder;
-		int fidx = pop_sprites_find(dat_chain_ptr->filename, resource);
+		// The header block sits immediately after the variable-length images[]
+		// pointer array within the same allocation (images[] is a flexible array
+		// member, so &images[n_images] is the first byte past it).
+		SDL_Surface* hdr_block = (esp_fidx >= 0)
+			? (SDL_Surface*)&chtab->images[n_images]
+			: NULL;
 		for (int i = 1; i <= n_images; i++) {
 			image_type* image;
-			if (fidx >= 0) {
+			if (esp_fidx >= 0) {
 				int w, h;
-				const unsigned char* px = pop_sprites_image(fidx, i - 1, &w, &h);
-				// NULL for empty slots (desktop parity: decode_image returns
-				// NULL when height == 0).
-				image = px ? pop_make_flash_surface(px, w, h) : NULL;
+				const unsigned char* px = pop_sprites_image(esp_fidx, i - 1, &w, &h);
+				if (px) {
+					image = &hdr_block[i - 1];
+					pop_fill_flash_surface(image, px, w, h);
+				} else {
+					// NULL for empty slots (desktop parity: decode_image returns
+					// NULL when height == 0). The unused header slot stays zeroed.
+					image = NULL;
+				}
 			} else {
-				// chtab not baked (built-in font res 1000, title res 40/50, or
-				// cutscene graphics not yet baked): hand back the shared 1x1
-				// placeholder so nothing dereferences a NULL image_type.
+				// chtab not baked (built-in font res 1000, or graphics not yet
+				// baked): hand back the shared 1x1 placeholder so nothing
+				// dereferences a NULL image_type.
 				if (g_pop_sprite_placeholder == NULL) {
 					g_pop_sprite_placeholder = SDL_CreateRGBSurface(0, 1, 1, 8, 0, 0, 0, 0);
 				}
@@ -1882,16 +1973,23 @@ rect_type *shrink2_rect(rect_type* target_rect,const rect_type* source_rect,int 
 // seg009:3BBA
 void restore_peel(peel_type* peel_ptr) {
 	//printf("restoring peel at (x=%d, y=%d)\n", peel_ptr.rect.left, peel_ptr.rect.top); // debug
-	method_6_blit_img_to_scr(peel_ptr->peel, peel_ptr->rect.left, peel_ptr->rect.top, /*0x10*/0);
+	// peel==NULL means the background save was skipped (out of 8-bit RAM); there is
+	// nothing to restore, just free the bookkeeping struct.
+	if (peel_ptr->peel != NULL) {
+		method_6_blit_img_to_scr(peel_ptr->peel, peel_ptr->rect.left, peel_ptr->rect.top, /*0x10*/0);
+	}
 	free_peel(peel_ptr);
 	//SDL_FreeSurface(peel_ptr.peel);
 }
 
 // seg009:3BE9
 peel_type* read_peel_from_screen(const rect_type* rect) {
-	// stub
 	peel_type* result = calloc(1, sizeof(peel_type));
 	//memset(&result, 0, sizeof(result));
+#ifdef ESP_PLATFORM
+	// On the ESP32 8-bit DRAM is scarce; if we cannot even record the peel, skip it.
+	if (result == NULL) return NULL;
+#endif
 	result->rect = *rect;
 #ifndef USE_ALPHA
 	SDL_Surface* peel_surface = SDL_CreateRGBSurface(0, rect->right - rect->left, rect->bottom - rect->top,
@@ -1900,8 +1998,16 @@ peel_type* read_peel_from_screen(const rect_type* rect) {
 	SDL_Surface* peel_surface = SDL_CreateRGBSurface(0, rect->right - rect->left, rect->bottom - rect->top, 32, Rmsk, Gmsk, Bmsk, Amsk);
 #endif
 	if (peel_surface == NULL) {
+#ifdef ESP_PLATFORM
+		// Out of 8-bit RAM for this background save. Rather than aborting the whole
+		// game, keep the peel record with a NULL surface: the sprite still draws,
+		// we just can't restore the background under it next frame (minor artifact).
+		result->peel = NULL;
+		return result;
+#else
 		sdlperror("read_peel_from_screen: SDL_CreateRGBSurface");
 		quit(1);
+#endif
 	}
 	result->peel = peel_surface;
 	rect_type target_rect = {0, 0, rect->right - rect->left, rect->bottom - rect->top};
@@ -1975,10 +2081,37 @@ byte* digi_remaining_pos = NULL;
 // The remaining length.
 int digi_remaining_length = 0;
 
+#ifdef ESP_PLATFORM
+// ---- ESP32 port: flash-streamed digi playback ----------------------------
+// Digitised SFX are NOT pre-converted into a big S16 heap buffer any more (that
+// needed 8-12 KB contiguous per sound, which the fragmented 8-bit heap can no
+// longer supply once the game is running, so the larger effects like the Kid
+// being hit fell silent). Instead the 8-bit samples stay in flash and are
+// expanded to S16 and resampled to digi_audiospec->freq on the fly in
+// digi_callback. Only a ~16-byte descriptor is allocated per sound.
+typedef struct pop_digi_stream_type {
+	byte type;              // mirrors sound_buffer_type.type (= sound_digi_converted)
+	const uint8_t* src;     // 8-bit source samples, in flash (never freed)
+	int count;              // source sample count
+	int rate;               // source sample rate (Hz)
+} pop_digi_stream_type;
+// Playback cursor (only one digi voice plays at a time).
+static const uint8_t* digi_flash_src = NULL;
+static int digi_flash_count = 0;    // source sample count
+static int digi_flash_rate = 11025; // source sample rate
+static int digi_flash_out_pos = 0;  // output frame cursor
+static int digi_flash_out_total = 0;// total output frames (after resample)
+#endif
+
 // The properties of the audio device.
 SDL_AudioSpec* digi_audiospec = NULL;
 // The desired samplerate. Everything will be resampled to this.
-const int digi_samplerate = 44100;
+// ESP32 port: 11025 Hz. Each SFX is converted on demand into a single contiguous
+// 8-bit-heap buffer whose size scales with this rate; during gameplay the largest
+// free block shrinks to ~3.3 KB (headers + peels resident), so 22050 Hz buffers
+// (~4 KB for a footstep) no longer fit. 11025 Hz halves them (~2 KB) so the common
+// SFX load and play, and it is still well within the internal DAC's output range.
+const int digi_samplerate = 11025;
 
 void stop_digi(void) {
 //	SDL_PauseAudio(1);
@@ -1998,6 +2131,12 @@ void stop_digi(void) {
 	digi_buffer = NULL;
 	digi_remaining_length = 0;
 	digi_remaining_pos = NULL;
+#ifdef ESP_PLATFORM
+	digi_flash_src = NULL;
+	digi_flash_count = 0;
+	digi_flash_out_pos = 0;
+	digi_flash_out_total = 0;
+#endif
 	SDL_UnlockAudio();
 }
 
@@ -2059,6 +2198,9 @@ void speaker_callback(void *userdata, Uint8 *stream, int len) {
 
 	if (current_speaker_sound == NULL) return;
 	word tempo = SDL_SwapLE16(current_speaker_sound->tempo);
+	// A malformed/garbage speaker resource can carry tempo==0; guard the divide
+	// below so we never trap or produce a wild note length.
+	if (tempo == 0) tempo = 1;
 
 	int total_samples_left = samples_requested;
 	while (total_samples_left > 0) {
@@ -2076,7 +2218,14 @@ void speaker_callback(void *userdata, Uint8 *stream, int len) {
 		}
 
 		int note_length_in_samples = (note->length * digi_audiospec->freq) / tempo;
-		int note_samples_to_emit = MIN(note_length_in_samples - current_speaker_note_samples_already_emitted, total_samples_left);
+		// Clamp the per-note sample count to a non-negative value. Corrupt or
+		// unused resources (e.g. POP's unused sound 31) can make
+		// (note_length - already_emitted) negative, which would turn copy_len into
+		// a huge size_t and let memset()/generate_square_wave run far past the
+		// output buffer, smashing the heap. Never emit fewer than 0 samples.
+		int note_samples_available = note_length_in_samples - current_speaker_note_samples_already_emitted;
+		if (note_samples_available < 0) note_samples_available = 0;
+		int note_samples_to_emit = MIN(note_samples_available, total_samples_left);
 		total_samples_left -= note_samples_to_emit;
 		size_t copy_len = (size_t)note_samples_to_emit * bytes_per_sample;
 		if (SDL_SwapLE16(note->frequency) <= 0x01 /*rest*/) {
@@ -2107,6 +2256,35 @@ void play_speaker_sound(sound_buffer_type* buffer) {
 }
 
 void digi_callback(void *userdata, Uint8 *stream, int len) {
+#ifdef ESP_PLATFORM
+	// Flash-streamed digi: expand the 8-bit source samples (in flash) to S16 mono
+	// and resample from digi_flash_rate to digi_audiospec->freq on the fly, so no
+	// multi-KB contiguous heap buffer is needed. Output is mono S16 (the feeder
+	// task turns it into 8-bit DAC samples).
+	short* out = (short*) stream;
+	int out_samples = len / (int) sizeof(short);
+	int i = 0;
+	if (is_sound_on && digi_flash_src != NULL && digi_audiospec != NULL) {
+		for (; i < out_samples && digi_flash_out_pos < digi_flash_out_total; ++i, ++digi_flash_out_pos) {
+			int src_idx = (int)(((int64_t)digi_flash_out_pos * digi_flash_rate) / digi_audiospec->freq);
+			if (src_idx >= digi_flash_count) src_idx = digi_flash_count - 1;
+			int s = digi_flash_src[src_idx];
+			out[i] = (short)((s | (s << 8)) - 32768);
+		}
+	}
+	// Pad the rest of the chunk with silence (S16 silence == 0).
+	for (; i < out_samples; ++i) out[i] = 0;
+	digi_remaining_length = (digi_flash_out_total - digi_flash_out_pos) * (int) sizeof(short);
+	if (digi_playing && digi_flash_out_pos >= digi_flash_out_total) {
+		SDL_Event event;
+		memset(&event, 0, sizeof(event));
+		event.type = SDL_USEREVENT;
+		event.user.code = userevent_SOUND;
+		digi_playing = 0;
+		SDL_PushEvent(&event);
+	}
+	return;
+#else
 	// Don't go over the end of either the input or the output buffer.
 	size_t copy_len = MIN(len, digi_remaining_length);
 	//printf("digi_callback(): copy_len = %d\n", copy_len);
@@ -2133,6 +2311,7 @@ void digi_callback(void *userdata, Uint8 *stream, int len) {
 	// Advance the pointer.
 	digi_remaining_length -= copy_len;
 	digi_remaining_pos += copy_len;
+#endif
 }
 
 void ogg_callback(void *userdata, Uint8 *stream, int len) {
@@ -2245,14 +2424,9 @@ void audio_callback(void* userdata, Uint8* stream_orig, int len_orig) {
 
 int digi_unavailable = 0;
 void init_digi() {
-#ifdef ESP_PLATFORM
-	// Audio is out of scope for now (optional, deferred to the final phase).
-	// Mark it permanently unavailable so every sound path (load_sound,
-	// convert_digi_sound, play_*_sound, ...) short-circuits via its existing
-	// `if (digi_unavailable)` guard instead of allocating/converting samples.
-	digi_unavailable = 1;
-	return;
-#endif
+	// ESP32 port: the SDL audio API (SDL_OpenAudio/SDL_PauseAudio/...) is backed
+	// by a real internal-DAC driver in sdlpop_shim.c, so the normal open path
+	// below works unchanged and drives the NS4871 amp on GPIO26.
 	if (digi_unavailable) return;
 	if (digi_audiospec != NULL) return;
 	// Open the audio device. Called once.
@@ -2277,7 +2451,7 @@ void init_digi() {
 	memset(desired, 0, sizeof(SDL_AudioSpec));
 	desired->freq = digi_samplerate; //buffer->digi.sample_rate;
 	desired->format = desired_audioformat;
-	desired->channels = 2;
+	desired->channels = 1; // ESP32 port: mono, single internal-DAC channel (GPIO26).
 	desired->samples = 1024;
 	desired->callback = audio_callback;
 	desired->userdata = NULL;
@@ -2325,16 +2499,13 @@ char* sound_name(int index) {
 }
 
 sound_buffer_type* convert_digi_sound(sound_buffer_type* digi_buffer);
+#ifdef ESP_PLATFORM
+static sound_buffer_type* pop_load_digi_flash(int index);
+#endif
 
 sound_buffer_type* load_sound(int index) {
 	sound_buffer_type* result = NULL;
 	//printf("load_sound(%d)\n", index);
-#ifdef ESP_PLATFORM
-	// Audio is out of scope for the ESP32 port (for now): skip all sound loading
-	// so we don't consume the scarce 8-bit heap. Callers tolerate NULL buffers.
-	(void)index;
-	return NULL;
-#endif
 	init_digi();
 	if (enable_music && !digi_unavailable && result == NULL && index >= 0 && index < max_sound_id) {
 		//printf("Trying to load from music folder\n");
@@ -2393,6 +2564,13 @@ sound_buffer_type* load_sound(int index) {
 	}
 	if (result == NULL) {
 		//printf("Trying to load from DAT\n");
+#ifdef ESP_PLATFORM
+		// Digitised SFX: stream straight from flash (no multi-KB RAM copy or
+		// converted buffer). Returns NULL for non-digi (e.g. PC-speaker) sounds,
+		// which then fall through to the normal in-RAM path below (those are tiny).
+		result = pop_load_digi_flash(index);
+		if (result == NULL)
+#endif
 		result = (sound_buffer_type*) load_from_opendats_alloc(index + 10000, "bin", NULL, NULL);
 	}
 	if (result != NULL && (result->type & 7) == sound_digi) {
@@ -2401,7 +2579,8 @@ sound_buffer_type* load_sound(int index) {
 		result = converted;
 	}
 	if (result == NULL && !skip_normal_data_files) {
-		fprintf(stderr, "Failed to load sound %d '%s'\n", index, sound_name(index));
+		const char* name = sound_name(index);
+		fprintf(stderr, "Failed to load sound %d '%s'\n", index, name ? name : "");
 	}
 	return result;
 }
@@ -2461,6 +2640,170 @@ bool determine_wave_version(sound_buffer_type *buffer, waveinfo_type* waveinfo) 
 	}
 }
 
+#ifdef ESP_PLATFORM
+// ---- ESP32 port: on-demand ("lazy") sound loading ------------------------
+// The full sound set (~113 KB of raw 8-bit digi samples) cannot be decoded and
+// resampled into RAM up front on this hardware. Instead each sound is loaded
+// only when it is about to play; the tiny PC-speaker note tables are cached in
+// sound_pointers[], while digi SFX are streamed straight from flash (their
+// 8-bit samples are expanded/resampled on the fly by digi_callback). POP only
+// plays one digi voice at a time, so at most one descriptor is live.
+static sound_buffer_type* g_lazy_playing_digi = NULL;
+
+static void pop_free_digi(sound_buffer_type* b) {
+	if (b == NULL) return;
+	// Digi descriptors are flash-streamed: their sample data lives in flash and
+	// must never be freed. Only the little descriptor struct is on the heap.
+	free(b);
+}
+
+// Build a flash-streaming digi descriptor for `index` WITHOUT copying the
+// multi-KB sample payload into RAM: the 8-bit samples stay in flash and are
+// expanded to S16 (and resampled to digi_audiospec->freq) on the fly by
+// digi_callback. Returns NULL if the resource is not a digitised sound (the
+// caller then falls back to the normal in-RAM path for PC-speaker/other types).
+extern void load_from_opendats_metadata(int resource_id, const char* extension, FILE** out_fp, data_location* result, byte* checksum, int* size, dat_type** out_pointer);
+static sound_buffer_type* pop_load_digi_flash(int index) {
+	dat_type* pointer = NULL;
+	data_location loc = data_none;
+	byte checksum = 0;
+	int size = 0;
+	FILE* fp = NULL;
+	load_from_opendats_metadata(index + 10000, "bin", &fp, &loc, &checksum, &size, &pointer);
+	if (loc != data_DAT || pointer == NULL || pointer->flash_res_ptr == NULL || size < 12) {
+		return NULL;
+	}
+	// The resource is a sound_buffer_type as stored in the DAT (read-only flash).
+	sound_buffer_type* flashbuf = (sound_buffer_type*) pointer->flash_res_ptr;
+	if ((flashbuf->type & 7) != sound_digi) return NULL; // not a digitised sound
+	waveinfo_type wi;
+	if (!determine_wave_version(flashbuf, &wi)) return NULL;
+	if (wi.sample_count <= 0 || wi.sample_rate <= 0 || wi.samples == NULL) return NULL;
+	pop_digi_stream_type* d = malloc(sizeof(pop_digi_stream_type));
+	if (d == NULL) return NULL;
+	d->type = sound_digi_converted; // engine treats it as a ready-to-play sound
+	d->src = (const uint8_t*) wi.samples; // 8-bit samples, in flash
+	d->count = wi.sample_count;
+	d->rate = wi.sample_rate;
+	return (sound_buffer_type*) d;
+}
+
+static void pop_ensure_sound_dats(void) {
+	static bool opened = false;
+	if (opened) return;
+	opened = true;
+	// Keep the sound DATs in the dat chain for the whole session so load_sound()
+	// can resolve resources on demand. They are flash-backed (no RAM cost) and
+	// their resource IDs (10000+) never collide with graphics resources.
+	open_dat("IBM_SND1.DAT", 0);
+	if (sound_flags & sfDigi) {
+		open_dat("DIGISND1.DAT", 0);
+		open_dat("DIGISND3.DAT", 0);
+	}
+	open_dat("IBM_SND2.DAT", 0);
+	if (sound_flags & sfDigi) {
+		open_dat("DIGISND2.DAT", 0);
+	}
+}
+
+// Returns the buffer to play for a sound id, loading it on demand. Digi buffers
+// are transient (owned by g_lazy_playing_digi, freed in play_digi_sound); the
+// caller must not free the result.
+sound_buffer_type* pop_ensure_sound(int id) {
+	if (id < 0) return NULL;
+	if (sound_pointers[id] != NULL) return sound_pointers[id];
+	pop_ensure_sound_dats();
+	sound_buffer_type* buf = load_sound(id);
+	if (buf == NULL) return NULL;
+	if ((buf->type & 7) == sound_speaker) {
+		sound_pointers[id] = buf; // cache tiny note tables permanently
+	}
+	return buf;
+}
+
+// Standalone audio self-test: exercises the DAC/digi pipeline with NO graphics
+// and NO game loop. Walks every sound resource id, loads it on demand, logs its
+// type/length + heap state, and plays digi sounds through the real feeder path.
+// Called from pop_game_task instead of pop_main() when POP_AUDIO_SELFTEST=1.
+void pop_audio_selftest(void) {
+	printf("\n=== POP AUDIO SELFTEST (no graphics) ===\n");
+
+	// Mimic parse_cmdline_sound(): enable digi + Sound Blaster mode, no music/ogg
+	// (there is no filesystem, so the ogg/music path stays disabled).
+	sound_flags |= sfDigi;
+	sound_mode = smSblast;
+	is_sound_on = 1;
+	enable_music = 0;
+
+	init_digi();
+	if (digi_unavailable || digi_audiospec == NULL) {
+		printf("selftest: digi unavailable, aborting\n");
+		return;
+	}
+	printf("selftest: digi ready freq=%d ch=%d fmt=0x%x\n",
+	       digi_audiospec->freq, digi_audiospec->channels, digi_audiospec->format);
+
+	pop_ensure_sound_dats();
+
+	const int last_id = 57; // POP has ~58 sound ids (0..57)
+	for (int id = 0; id <= last_id; ++id) {
+		sound_buffer_type* b = load_sound(id);
+		if (b == NULL) {
+			printf("selftest: id=%2d -> (none) free=%u largest=%u\n", id,
+			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+			continue;
+		}
+		int type = b->type & 7;
+		if (type == sound_digi_converted) {
+			// Digitized SFX: play through the DAC feeder. Ownership passes to
+			// g_lazy_playing_digi (freed on the next play_digi_sound).
+			printf("selftest: id=%2d digi    len=%d -> PLAY  free=%u largest=%u\n", id,
+			       b->converted.length,
+			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+			play_sound_from_buffer(b);
+			int guard = 0;
+			while (check_sound_playing() && guard++ < 500) { // up to ~5s
+				SDL_Delay(10);
+			}
+			SDL_Delay(250); // brief gap between sounds
+		} else if (type == sound_speaker) {
+			// PC-speaker melody/beep (option 1): synthesized as a square wave by
+			// speaker_callback and mixed into the same DAC output. The intro tune
+			// and other beeper effects arrive here (from the IBM_SND DATs).
+			printf("selftest: id=%2d speaker      -> PLAY  free=%u largest=%u\n", id,
+			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+			play_sound_from_buffer(b); // -> play_speaker_sound (points into b)
+			int guard = 0;
+			while (check_sound_playing() && guard++ < 1500) { // up to ~15s (tunes)
+				SDL_Delay(10);
+			}
+			// Ensure the feeder no longer references b, then release it (load_sound
+			// returns a fresh buffer each call; not cached here).
+			speaker_sound_stop();
+			pop_free_digi(b);
+			SDL_Delay(250);
+		} else {
+			// MIDI/other: unsupported in this port (no synth). Log and release.
+			printf("selftest: id=%2d type=%d (unsupported, skip) free=%u\n", id, type,
+			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+			pop_free_digi(b);
+		}
+
+		// Bisect the heap corruptor: verify integrity right after each sound so
+		// the offending id is caught at its source (before the monitor task's
+		// passive walk trips over it later). Requires heap poisoning enabled.
+		if (!heap_caps_check_integrity_all(true)) {
+			printf("selftest: *** HEAP CORRUPT detected after id=%d ***\n", id);
+		}
+	}
+
+	printf("=== POP AUDIO SELFTEST DONE ===\n\n");
+}
+#endif // ESP_PLATFORM
+
 sound_buffer_type* convert_digi_sound(sound_buffer_type* digi_buffer) {
 	init_digi();
 	if (digi_unavailable) return NULL;
@@ -2471,15 +2814,21 @@ sound_buffer_type* convert_digi_sound(sound_buffer_type* digi_buffer) {
 
 	int source_length = waveinfo.sample_count;
 	int expanded_frames = source_length * digi_audiospec->freq / waveinfo.sample_rate;
-	int expanded_length = expanded_frames * 2 * sizeof(short);
-	sound_buffer_type* converted_buffer = malloc(sizeof(sound_buffer_type) + expanded_length);
+	// Size the payload for the ACTUAL output layout (channels) and allocate it
+	// exactly once. The upstream code hardcoded 2 channels and passed a
+	// byte-count where a sample-count was expected (sizeof(short) * length),
+	// over-allocating ~3x per sound — unaffordable here and wrong for mono.
+	// Fail gracefully (NULL) on OOM so a low-heap sound is silent, not a crash.
+	int expanded_length = expanded_frames * digi_audiospec->channels * (int)sizeof(short);
+	sound_buffer_type* converted_buffer = malloc(sizeof(sound_buffer_type));
+	if (converted_buffer == NULL) return NULL;
 
 	converted_buffer->type = sound_digi_converted;
 	converted_buffer->converted.length = expanded_length;
 
 	byte* source = waveinfo.samples;
-	//short* dest = converted_buffer->converted.samples;
-	short* dest = malloc(sizeof(short) * converted_buffer->converted.length);
+	short* dest = malloc((size_t)expanded_length);
+	if (dest == NULL) { free(converted_buffer); return NULL; }
         converted_buffer->converted.samples = dest;
 
 	for (int i = 0; i < expanded_frames; ++i) {
@@ -2516,6 +2865,33 @@ void play_digi_sound(sound_buffer_type* buffer) {
 		printf("Tried to play unconverted digi sound.\n");
 		return;
 	}
+#ifdef ESP_PLATFORM
+	// Free the previous on-demand digi buffer: stop_digi() has just detached it
+	// under the audio lock, so the feeder task can no longer be reading it.
+	if (g_lazy_playing_digi != NULL && g_lazy_playing_digi != buffer) {
+		pop_free_digi(g_lazy_playing_digi);
+	}
+	g_lazy_playing_digi = buffer;
+	// Flash-streamed descriptor: set up the resampling cursor. digi_callback
+	// expands the 8-bit flash samples to S16 and resamples rate -> device freq.
+	{
+		pop_digi_stream_type* d = (pop_digi_stream_type*) buffer;
+		SDL_LockAudio();
+		digi_flash_src = d->src;
+		digi_flash_count = d->count;
+		digi_flash_rate = (d->rate > 0) ? d->rate : digi_samplerate;
+		digi_flash_out_pos = 0;
+		// Total output frames after resampling source count to the device rate.
+		digi_flash_out_total = (int)(((int64_t)d->count * digi_audiospec->freq) / digi_flash_rate);
+		digi_playing = 1;
+		digi_remaining_length = digi_flash_out_total * (int) sizeof(short);
+		digi_buffer = NULL;
+		digi_remaining_pos = NULL;
+		SDL_UnlockAudio();
+	}
+	SDL_PauseAudio(0);
+	return;
+#endif
 	SDL_LockAudio();
 	digi_buffer = (byte*) buffer->converted.samples;
 	digi_playing = 1;
@@ -3105,10 +3481,11 @@ void close_dat(dat_type* pointer) {
 			// dat_table points into flash for embedded DATs (flash_base != NULL);
 			// only free it when it was really malloc'd (directory/desktop case).
 			if (curr->flash_base == NULL && curr->dat_table) free(curr->dat_table);
+			if (!pop_dat_pool_free(curr)) free(curr);
 #else
 			if (curr->dat_table) free(curr->dat_table);
-#endif
 			free(curr);
+#endif
 			return;
 		}
 		curr = curr->next_dat;

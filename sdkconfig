@@ -838,6 +838,19 @@ CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
 # end of Common ESP-related
 
 #
+# ESP-Driver:DAC Configurations
+#
+# default:
+# CONFIG_DAC_CTRL_FUNC_IN_IRAM is not set
+# default:
+# CONFIG_DAC_ISR_IRAM_SAFE is not set
+# default:
+# CONFIG_DAC_ENABLE_DEBUG_LOG is not set
+# default:
+CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=y
+# end of ESP-Driver:DAC Configurations
+
+#
 # ESP-Driver:GPIO Configurations
 #
 # default:
@@ -845,8 +858,21 @@ CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
 # end of ESP-Driver:GPIO Configurations
 
 #
+# ESP-Driver:I2S Configurations
+#
+# default:
+# CONFIG_I2S_ISR_IRAM_SAFE is not set
+# default:
+# CONFIG_I2S_CTRL_FUNC_IN_IRAM is not set
+# default:
+# CONFIG_I2S_ENABLE_DEBUG_LOG is not set
+# end of ESP-Driver:I2S Configurations
+
+#
 # ESP-Driver:SPI Configurations
 #
+# default:
+# CONFIG_SPI_MASTER_IN_IRAM is not set
 # default:
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 # default:
@@ -1037,15 +1063,15 @@ CONFIG_ESP_INTR_IN_IRAM=y
 # LibC
 #
 # default:
-# CONFIG_LIBC_NEWLIB is not set
+CONFIG_LIBC_NEWLIB=y
 # default:
-CONFIG_LIBC_PICOLIBC=y
-# default:
-CONFIG_LIBC_PICOLIBC_NEWLIB_COMPATIBILITY=y
+# CONFIG_LIBC_PICOLIBC is not set
 # default:
 CONFIG_LIBC_MISC_IN_IRAM=y
 # default:
 CONFIG_LIBC_LOCKS_PLACE_IN_IRAM=y
+# default:
+# CONFIG_LIBC_NEWLIB_NANO_FORMAT is not set
 # default:
 CONFIG_LIBC_TIME_SYSCALL_USE_RTC_HRT=y
 # default:
@@ -1072,11 +1098,11 @@ CONFIG_LIBC_ASSERT_BUFFER_SIZE=200
 # Power Management
 #
 # default:
-# CONFIG_PM_SLEEP_FUNC_IN_IRAM is not set
+CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
 # default:
 # CONFIG_PM_ENABLE is not set
 # default:
-# CONFIG_PM_SLP_IRAM_OPT is not set
+CONFIG_PM_SLP_IRAM_OPT=y
 # end of Power Management
 
 #
@@ -1342,7 +1368,7 @@ CONFIG_FREERTOS_CORETIMER_0=y
 # default:
 CONFIG_FREERTOS_SYSTICK_USES_CCOUNT=y
 # default:
-# CONFIG_FREERTOS_IN_IRAM is not set
+CONFIG_FREERTOS_IN_IRAM=y
 # default:
 # CONFIG_FREERTOS_CHECK_PORT_CRITICAL_COMPLIANCE is not set
 # end of Port
@@ -1796,14 +1822,13 @@ CONFIG_MBEDTLS_HARDWARE_SHA=y
 # default:
 CONFIG_MBEDTLS_HARDWARE_MPI=y
 # default:
-CONFIG_MBEDTLS_LARGE_KEY_SOFTWARE_MPI=y
+# CONFIG_MBEDTLS_LARGE_KEY_SOFTWARE_MPI is not set
 # default:
 CONFIG_MBEDTLS_HARDWARE_AES=y
 # default:
 # CONFIG_MBEDTLS_AES_SOFT_FALLBACK is not set
 # default:
 CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=y
-# default:
 # CONFIG_MBEDTLS_SECURE_ELEMENT_DRIVER_ENABLED is not set
 # end of Hardware Acceleration
 
@@ -2048,6 +2073,7 @@ CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_0=y
 CONFIG_BROWNOUT_DET_LVL=0
 CONFIG_ESP32_BROWNOUT_DET_LVL=0
 CONFIG_ESP_SYSTEM_BROWNOUT_INTR=y
+# CONFIG_NEWLIB_NANO_FORMAT is not set
 CONFIG_NEWLIB_TIME_SYSCALL_USE_RTC_HRT=y
 CONFIG_ESP32_TIME_SYSCALL_USE_RTC_HRT=y
 CONFIG_ESP32_TIME_SYSCALL_USE_RTC_FRC1=y

@@ -657,6 +657,10 @@ void set_pal_256(rgb_type* source);
 void set_chtab_palette(chtab_type* chtab, byte* colors, int n_colors);
 int has_timer_stopped(int index);
 sound_buffer_type* load_sound(int index);
+#ifdef ESP_PLATFORM
+sound_buffer_type* pop_ensure_sound(int id); // ESP32 port: load a sound on demand
+void pop_audio_selftest(void); // ESP32 port: standalone audio test (no graphics)
+#endif
 void free_sound(sound_buffer_type* buffer);
 
 // SEQTABLE.C

@@ -48,9 +48,11 @@ pull-ups, so a pressed button reads LOW; no external resistors are needed.
 | Left | GPIO32 | Walk / run left |
 | Right | GPIO33 | Walk / run right |
 | Up | GPIO25 | Jump / climb up |
-| Down | GPIO26 | Crouch / climb down / pick up |
-| Shift | GPIO27 | Grab ledge / careful step / draw & sheathe sword |
+| Down | GPIO27 | Crouch / climb down / pick up |
+| Shift | GPIO13 | Grab ledge / careful step / draw & sheathe sword |
 
+> GPIO26 is reserved for the audio output (internal DAC -> NS4871 amp), so the
+> Down and Shift buttons were moved off it (Down 26->27, Shift 27->13).
 > Avoid the GPIOs already used by the LCD (5, 18, 19, 21, 22, 23) and the
 > input-only pins 34–39 (they have no internal pull-up).
 
@@ -73,11 +75,11 @@ two peripherals wire to opposite sides.
   (Left)  GND-[/_]-- 32 o                 o 21 ----| MISO  -> 19  |
   (Right) GND-[/_]-- 33 o                 o 19 ----| CS    -> 5   |
   (Up)    GND-[/_]-- 25 o                 o 18 ----| DC/RS -> 21  |
-  (Down)  GND-[/_]-- 26 o                 o 5  ----| RST   -> 22  |
-  (Shift) GND-[/_]-- 27 o                 o 17     | LED   -> 3V3 |
+  (Audio) DAC ------ 26 o                 o 5  ----| RST   -> 22  |
+  (Down)  GND-[/_]-- 27 o                 o 17     | LED   -> 3V3 |
                      14 o                 o 16     +--------------+
                      12 o                 o 4
-                     13 o                 o 0
+  (Shift) GND-[/_]-- 13 o                 o 0
                     GND o-----------------o 2   (optional: LCD backlight)
                     VIN o                 o 15
                         |                 o GND
@@ -89,6 +91,26 @@ Legend: `o` = header pin · `[ /_ ]` = momentary push-button. The firmware
 enables the ESP32 internal pull-ups, so an open button reads HIGH and a pressed
 button pulls its GPIO to GND (LOW). Tie all the button GNDs and the LCD GND to a
 common board GND.
+
+**Audio (NS4871 mono amplifier)**
+
+Sound is output on **GPIO26**, which is DAC channel 1 (the ESP32's built-in
+8-bit digital-to-analog converter), driven continuously over DMA. Route it to a
+mono analog Class-AB amplifier such as the **NS4871** (4 Ω / 2 W speaker):
+
+| Signal | From | To |
+| ------ | ---- | -- |
+| Audio | GPIO26 (DAC) | amp input tip (via ~10 kΩ volume pot / attenuator) |
+| Ground | ESP32 GND | amp GND |
+
+- The **volume pot / attenuator is important**: the DAC swings the full 0–3.3 V,
+  which is much hotter than the ~0.5–1 V the amp expects and will clip/overdrive
+  without it. A software attenuation (`POP_AUDIO_VOLUME`, 0–256, in
+  `main/sdlpop_shim.c`) is also available for bare-wire bench tests.
+- If the amp's input is not already AC-coupled, add a 1–10 µF series capacitor to
+  block the DAC's DC bias.
+- Power the amp from its **own supply/battery** (its 2 W speaker current would
+  brown out the ESP32 3V3 rail); only the ground is shared.
 
 ### Build and Flash
 

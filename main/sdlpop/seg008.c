@@ -888,7 +888,12 @@ void add_peel(int left,int right,int top,int height) {
 	rect.right = right;
 	rect.top = top;
 	rect.bottom = top + height;
-	peels_table[peels_count] = read_peel_from_screen(&rect);
+	peel_type* peel = read_peel_from_screen(&rect);
+	if (peel == NULL) {
+		// ESP: out of 8-bit RAM even for the peel record; skip it (minor artifact).
+		return;
+	}
+	peels_table[peels_count] = peel;
 	peels_count++;
 }
 
@@ -956,18 +961,68 @@ void draw_back_fore(int which_table,int index) {
 }
 
 
+#ifdef ESP_PLATFORM
+/* Upper bound (in bytes) for a sprite flipped without allocation. Sprites larger
+ * than this fall back to the allocating path below; game character sprites (the
+ * only ones flipped) are far smaller than this. */
+#define POP_HFLIP_SCRATCH_BYTES 8192
+#endif
+
 SDL_Surface* hflip(SDL_Surface* input) {
 	int width = input->w;
 	int height = input->h;
 
+#ifdef ESP_PLATFORM
+	/* ESP32: the original path allocated a full sprite copy via
+	 * SDL_ConvertSurface on EVERY frame for EVERY left-facing sprite, churning
+	 * and fragmenting the scarce 8-bit heap. Instead flip in place into a single
+	 * reusable static scratch surface. This is safe because the game task is
+	 * single-threaded and draw_mid() consumes the result (draw_image) before the
+	 * next hflip() call. Every sprite in this port is INDEX8. */
+	if (input->format->BytesPerPixel == 1) {
+		static SDL_Surface scratch;
+		static Uint8 scratch_pixels[POP_HFLIP_SCRATCH_BYTES];
+		int pitch = width; /* INDEX8, tightly packed */
+		if ((size_t)pitch * (size_t)height <= sizeof(scratch_pixels)) {
+			scratch.flags = 0;
+			scratch.format = input->format;
+			scratch.w = width;
+			scratch.h = height;
+			scratch.pitch = pitch;
+			scratch.pixels = scratch_pixels;
+			scratch.clip_rect.x = 0; scratch.clip_rect.y = 0;
+			scratch.clip_rect.w = width; scratch.clip_rect.h = height;
+			/* refcount > 1 marks this as statically backed so SDL_FreeSurface()
+			 * treats the draw_mid() free as a no-op. */
+			scratch.refcount = 2;
+			scratch.has_colorkey = input->has_colorkey;
+			scratch.colorkey = input->colorkey;
+			scratch.pool_backed = SDL_FALSE;
+			scratch.flash_backed = SDL_FALSE;
+			for (int y = 0; y < height; ++y) {
+				const Uint8* srow = (const Uint8*)input->pixels + (size_t)y * input->pitch;
+				Uint8* drow = scratch_pixels + (size_t)y * pitch;
+				for (int x = 0; x < width; ++x) {
+					drow[x] = srow[width - 1 - x];
+				}
+			}
+			return &scratch;
+		}
+		/* Sprite too big for the scratch (very rare): fall through to the
+		 * allocating path, which degrades gracefully on OOM. */
+	}
+#endif
+
 	// The simplest way to create a surface with same format as input:
 	SDL_Surface* output = SDL_ConvertSurface(input, input->format, 0);
-	SDL_SetSurfacePalette(output, input->format->palette);
 	// The copied image will be overwritten anyway.
 	if (output == NULL) {
-		sdlperror("hflip: SDL_ConvertSurface");
-		quit(1);
+		// ESP32 port: the 8-bit heap can be momentarily exhausted mid-frame.
+		// Return NULL so the caller skips this one sprite for this frame rather
+		// than calling quit()/abort() and killing the whole game.
+		return NULL;
 	}
+	SDL_SetSurfacePalette(output, input->format->palette);
 
 	SDL_SetSurfaceBlendMode(input, SDL_BLENDMODE_NONE);
 	// Temporarily turn off alpha and colorkey on input. So we overwrite the output image.
@@ -1022,8 +1077,14 @@ void draw_mid(int index) {
 	if (blit_flip) {
 		xpos -= image->w/*width*/;
 		// for this version:
-		need_free_image = 1;
 		image = hflip(image);
+		if (image == NULL) {
+			// Out of 8-bit RAM to build the flipped copy: skip this sprite this
+			// frame (visual glitch) instead of aborting.
+			if (chtab_flip_clip[chtab_id]) reset_clip_rect();
+			return;
+		}
+		need_free_image = 1;
 	}
 
 	if (midtable_entry->peel) {

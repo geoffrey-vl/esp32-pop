@@ -19,8 +19,11 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "driver/dac_continuous.h"
 
 #include "dat_registry.h"
 
@@ -363,10 +366,10 @@ static SDL_Surface *create_surface_impl(int width, int height, int depth,
             s->pixels = calloc(1, nbytes);
         }
         if (!s->pixels) {
-            printf("CreateRGBSurface: pixels alloc failed w=%d h=%d d=%d pitch=%d nbytes=%u free=%u largest=%u\n",
+            printf("CreateRGBSurface: pixels alloc failed w=%d h=%d d=%d pitch=%d nbytes=%u free8=%u largest8=%u\n",
                    width, height, depth, pitch, (unsigned)nbytes,
-                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
         }
     }
     if (!s->pixels) {
@@ -415,6 +418,36 @@ SDL_Surface *pop_make_flash_surface(const void *pixels, int width, int height)
     return s;
 }
 
+/* Fill a caller-provided SDL_Surface header describing a flash-backed sprite.
+ * load_sprites_from_file uses this to pack a whole chtab's image headers into
+ * ONE contiguous block (appended to the chtab allocation) instead of one malloc
+ * per sprite. That removes ~n_images per-block heap overheads AND keeps the
+ * level's sprite headers from peppering (fragmenting) the tiny 8-bit heap, which
+ * leaves larger contiguous holes for peels and on-demand sound buffers.
+ * refcount is set to 2 so SDL_FreeSurface never frees an individual header; the
+ * whole block is released in a single free(chtab) inside free_chtab. */
+void pop_fill_flash_surface(SDL_Surface *s, const void *pixels, int width, int height)
+{
+    if (!g_flash_format_ready) {
+        g_flash_format.format = SDL_PIXELFORMAT_INDEX8;
+        g_flash_format.BitsPerPixel = 8;
+        g_flash_format.BytesPerPixel = 1;
+        g_flash_format.Rmask = g_flash_format.Gmask = g_flash_format.Bmask = g_flash_format.Amask = 0;
+        g_flash_format.palette = shared_sprite_palette();
+        g_flash_format_ready = SDL_TRUE;
+    }
+    /* Caller has already zeroed the header (chtab block is memset to 0), so the
+     * colorkey/pool_backed fields are already clear. */
+    s->format = &g_flash_format;
+    s->w = width;
+    s->h = height;
+    s->pitch = width; /* baked pixels are tightly packed, 1 byte/pixel */
+    s->pixels = (void *)pixels; /* read-only flash; sprites are blit sources only */
+    s->clip_rect.x = 0; s->clip_rect.y = 0; s->clip_rect.w = width; s->clip_rect.h = height;
+    s->refcount = 2; /* block-backed: never freed individually by SDL_FreeSurface */
+    s->flash_backed = SDL_TRUE;
+}
+
 void SDL_FreeSurface(SDL_Surface *surface)
 {
     if (!surface) return;
@@ -422,6 +455,10 @@ void SDL_FreeSurface(SDL_Surface *surface)
      * is too big to decode into RAM; many chtab entries point at it, so freeing
      * it (on level teardown) would double-free. Never free it. */
     if (surface == g_pop_sprite_placeholder) return;
+    /* Statically-backed scratch surfaces (e.g. the hflip flip buffer) are never
+     * heap-allocated; they mark themselves with refcount > 1 so freeing them is
+     * a no-op. */
+    if (surface->refcount > 1) return;
     /* Flash-backed sprite surfaces share one static format/palette and point at
      * read-only flash pixels (see pop_sprites.c). Free only the SDL_Surface
      * struct itself; never touch the shared format or the flash pixels. */
@@ -722,14 +759,154 @@ SDL_Haptic *SDL_HapticOpen(int i) { (void)i; return NULL; }
 int  SDL_HapticRumbleInit(SDL_Haptic *h) { (void)h; return 0; }
 int  SDL_HapticRumblePlay(SDL_Haptic *h, float s, Uint32 l) { (void)h; (void)s; (void)l; return 0; }
 
-/* ---------------------------------------------------------------- audio */
-int  SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained)
-{ if (obtained && desired) *obtained = *desired; return 0; }
+/* ---------------------------------------------------------------- audio
+ * Real audio backend for the ESP32 port. SDLPoP's mixer (seg009.c) is written
+ * against the SDL "pull" audio model: SDL_OpenAudio() registers a callback that
+ * fills a 16-bit signed buffer at digi_samplerate, and the game toggles playback
+ * with SDL_PauseAudio(). On this port the mixer is opened as MONO (one internal
+ * DAC channel), so the callback produces mono S16. We back that API with the
+ * ESP32 built-in DAC (channel 1 = GPIO26) driven continuously over DMA
+ * (driver/dac_continuous.h). A feeder task pinned to core 0 (core 1 runs the
+ * game + SPI present) repeatedly pulls a chunk from the mixer callback, converts
+ * S16->U8, and writes it to the DAC; dac_continuous_write blocks until the
+ * samples are queued, self-pacing the task to the sample rate. The single DAC
+ * channel matches the mono NS4871 amp.
+ */
+
+// Compile-time software volume, 0..256 (256 = unity). A hardware volume pot on
+// the DAC output is still recommended; this only makes a bare-wire bench test
+// safer by attenuating the full 0..3.3V DAC swing.
+#ifndef POP_AUDIO_VOLUME
+#define POP_AUDIO_VOLUME 256
+#endif
+
+#define POP_AUDIO_CHUNK_FRAMES 1024   // frames pulled from the mixer per iteration
+
+// The ESP32 internal DAC's continuous-mode DMA clock divider cannot reach the
+// mixer's 11025 Hz (it fails with "mclk division exceed the maximum value 255").
+// So the mixer/converted-sound buffers stay at digi_samplerate (11025 Hz, which
+// keeps each on-demand SFX buffer small for the fragmented 8-bit heap), but the
+// DAC is clocked at POP_DAC_UPSAMPLE x that rate (22050 Hz, known-good) and the
+// feeder duplicates each mixer sample POP_DAC_UPSAMPLE times. Nearest-neighbour
+// 2x upsampling is inaudible for these 8-bit SFX.
+#define POP_DAC_UPSAMPLE 2
+
+static dac_continuous_handle_t g_dac_handle = NULL;
+static SemaphoreHandle_t       g_audio_mutex = NULL;
+static SDL_AudioSpec           g_audio_spec;
+static volatile int            g_audio_paused = 1;   // SDL audio starts paused
+
+static void pop_audio_feeder_task(void *arg)
+{
+    (void)arg;
+    const int frames = POP_AUDIO_CHUNK_FRAMES;
+    const int out_frames = frames * POP_DAC_UPSAMPLE; // samples written to the DAC
+    // Mixer output: mono 16-bit signed -> frames * 1 ch * 2 bytes.
+    int16_t *mono16 = malloc(frames * sizeof(int16_t));
+    uint8_t *mono8  = malloc(out_frames);
+    if (mono16 == NULL || mono8 == NULL) {
+        ESP_LOGE("pop_audio", "feeder buffer alloc failed");
+        free(mono16);
+        free(mono8);
+        vTaskDelete(NULL);
+        return;
+    }
+    memset(mono8, 128, out_frames); // mid-rail silence for the paused state
+
+    for (;;) {
+        if (g_audio_paused) {
+            // Keep the DMA fed with mid-rail so the AC-coupled amp stays quiet
+            // and the DAC holds a steady level (no pops).
+            memset(mono8, 128, out_frames);
+        } else {
+            xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+            // Pull one mono chunk from SDLPoP's mixer (fills silence + mixes).
+            g_audio_spec.callback(g_audio_spec.userdata, (Uint8 *)mono16,
+                                  frames * (int)sizeof(int16_t));
+            xSemaphoreGive(g_audio_mutex);
+
+            for (int i = 0; i < frames; ++i) {
+                int s = mono16[i];
+#if POP_AUDIO_VOLUME != 256
+                s = (s * POP_AUDIO_VOLUME) >> 8;
+#endif
+                // S16 signed [-32768,32767] -> U8 unsigned [0,255].
+                uint8_t u8 = (uint8_t)((s + 32768) >> 8);
+                // Duplicate each mixer sample POP_DAC_UPSAMPLE times so the DAC
+                // (clocked POP_DAC_UPSAMPLE x higher) plays it at the same pitch.
+                for (int k = 0; k < POP_DAC_UPSAMPLE; ++k) {
+                    mono8[i * POP_DAC_UPSAMPLE + k] = u8;
+                }
+            }
+        }
+
+        size_t written = 0;
+        // Blocks until the whole chunk is queued into the DMA descriptors,
+        // pacing this task to the DAC sample rate.
+        dac_continuous_write(g_dac_handle, mono8, out_frames, &written, -1);
+    }
+}
+
+int SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained)
+{
+    if (desired == NULL) return -1;
+    // SDL fills in the silence value for the negotiated format; the mixer uses
+    // digi_audiospec->silence to blank the buffer (0 for signed 16-bit).
+    desired->silence = (desired->format == AUDIO_U8) ? 128 : 0;
+    if (obtained) *obtained = *desired;
+
+    if (g_dac_handle != NULL) return 0; // already opened
+
+    g_audio_spec = *desired;
+    g_audio_paused = 1;
+
+    g_audio_mutex = xSemaphoreCreateMutex();
+    if (g_audio_mutex == NULL) {
+        ESP_LOGE("pop_audio", "mutex create failed");
+        return -1;
+    }
+
+    dac_continuous_config_t cfg = {
+        .chan_mask = DAC_CHANNEL_MASK_CH1,     // channel 1 = GPIO26
+        .desc_num  = 2,                        // 2x2048 DMA buffers (~186ms @22050);
+                                               // was 4, halved to free ~4KB 8-bit DRAM
+        .buf_size  = 2048,
+        .freq_hz   = desired->freq * POP_DAC_UPSAMPLE, // DAC runs above the mixer
+                                               // rate (11025 Hz) to stay within the
+                                               // DAC DMA clock-divider range (22050 Hz)
+        .offset    = 0,
+        .clk_src   = DAC_DIGI_CLK_SRC_DEFAULT, // PLL clock source
+        .chan_mode = DAC_CHANNEL_MODE_SIMUL,
+    };
+    esp_err_t err = dac_continuous_new_channels(&cfg, &g_dac_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("pop_audio", "dac_continuous_new_channels: %s", esp_err_to_name(err));
+        g_dac_handle = NULL;
+        return -1;
+    }
+    err = dac_continuous_enable(g_dac_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("pop_audio", "dac_continuous_enable: %s", esp_err_to_name(err));
+        dac_continuous_del_channels(g_dac_handle);
+        g_dac_handle = NULL;
+        return -1;
+    }
+
+    // Feeder on core 0 (PRO_CPU); the game + SPI present run on core 1.
+    xTaskCreatePinnedToCore(pop_audio_feeder_task, "pop_audio", 4096, NULL, 5, NULL, 0);
+    ESP_LOGI("pop_audio", "DAC audio on GPIO26 @ %d Hz (mono, mixer %d Hz x%d)",
+             desired->freq * POP_DAC_UPSAMPLE, desired->freq, POP_DAC_UPSAMPLE);
+    return 0;
+}
 void SDL_CloseAudio(void) {}
-void SDL_PauseAudio(int p) { (void)p; }
-void SDL_LockAudio(void) {}
-void SDL_UnlockAudio(void) {}
-SDL_AudioStatus SDL_GetAudioStatus(void) { return SDL_AUDIO_STOPPED; }
+void SDL_PauseAudio(int p) { g_audio_paused = (p != 0); }
+void SDL_LockAudio(void) { if (g_audio_mutex) xSemaphoreTake(g_audio_mutex, portMAX_DELAY); }
+void SDL_UnlockAudio(void) { if (g_audio_mutex) xSemaphoreGive(g_audio_mutex); }
+SDL_AudioStatus SDL_GetAudioStatus(void)
+{
+    if (g_dac_handle == NULL) return SDL_AUDIO_STOPPED;
+    return g_audio_paused ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING;
+}
 int  SDL_BuildAudioCVT(SDL_AudioCVT *cvt, SDL_AudioFormat sf, Uint8 sc, int sr,
                        SDL_AudioFormat df, Uint8 dc, int dr)
 { (void)sf; (void)sc; (void)sr; (void)df; (void)dc; (void)dr; if (cvt) { cvt->needed = 0; cvt->len_mult = 1; cvt->len_ratio = 1.0; } return 0; }

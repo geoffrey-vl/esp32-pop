@@ -701,7 +701,16 @@ void load_intro(int which_imgs,cutscene_ptr_type func,int free_sounds) {
 	func();
 	is_cutscene = 0;
 	free_all_chtabs_from(3);
+#ifndef ESP_PLATFORM
+	// Desktop: fade_out_1() has already faded the scene to black via the palette;
+	// this just guarantees a clean black screen before the level loads.
+	// On the ESP32 USE_FADE is off, so fade_out_1() is a no-op. Blacking the screen
+	// here makes play_level()'s "while (check_sound_playing()) idle();" wait present
+	// an abrupt ~1s black gap while the cutscene audio tail finishes. Instead keep
+	// the last cutscene frame on screen; draw_level_first() paints the new level
+	// over it once loading is done.
 	draw_rect(&screen_rect, color_0_black);
+#endif
 }
 
 typedef struct star_type {

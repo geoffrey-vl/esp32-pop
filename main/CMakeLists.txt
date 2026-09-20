@@ -60,7 +60,7 @@ file(WRITE "${dat_registry_src}" "${dat_registry_body}\n${dat_registry_table}")
 
 idf_component_register(SRCS ${srcs} "${dat_registry_src}"
                     INCLUDE_DIRS "." "prince_dat/include" "sdlpop/shim" "sdlpop"
-                    PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer
+                    PRIV_REQUIRES esp_driver_spi esp_driver_gpio esp_timer esp_driver_dac
                     EMBED_FILES ${dat_files} "assets/pop_sprites.bin")
 
 set_source_files_properties(${sdlpop_srcs}

@@ -20,6 +20,12 @@
 #include "dat_file.h"
 #include "dat_image.h"
 
+/* Set to 1 to run the standalone audio self-test (walks every sound resource,
+ * plays each digi sound through the DAC feeder) instead of the full game. Handy
+ * for isolating the audio pipeline from graphics/game-loop issues. Set back to 0
+ * for normal gameplay. */
+#define POP_AUDIO_SELFTEST 0
+
 /*
  This code displays some fancy graphics on the 320x240 LCD on an ESP-WROVER_KIT board.
  This example demonstrates the use of both spi_device_transmit as well as
@@ -54,7 +60,9 @@
 
 //To speed up transfers, every SPI transfer sends a bunch of lines. This define specifies how many. More means more memory use,
 //but less overhead for setting up / finishing transfers. Make sure 240 is dividable by this.
-#define PARALLEL_LINES 16
+#define PARALLEL_LINES 8   // 8 rows/band: two 320xN RGB565 DMA line buffers cost
+                           // 320*8*2*2 = 10KB (vs 20KB at 16). Frees ~10KB of the
+                           // scarce 8-bit DRAM at the cost of 2x more SPI bands/frame.
 
 //Panel geometry.
 #define LCD_WIDTH  320
@@ -484,8 +492,8 @@ void pop_present_indexed(const unsigned char *pix, int w, int h, int pitch)
 #define POP_PIN_LEFT   GPIO_NUM_32
 #define POP_PIN_RIGHT  GPIO_NUM_33
 #define POP_PIN_UP     GPIO_NUM_25
-#define POP_PIN_DOWN   GPIO_NUM_26
-#define POP_PIN_SHIFT  GPIO_NUM_27
+#define POP_PIN_DOWN   GPIO_NUM_27   // moved from 26: GPIO26 is now the audio DAC output
+#define POP_PIN_SHIFT  GPIO_NUM_13   // moved from 27
 
 void pop_input_init(void)
 {
@@ -515,6 +523,7 @@ unsigned int pop_read_buttons(void)
 
 /* --- SDLPoP engine bridge (implemented in pop_glue.c) --- */
 extern void pop_main(void);
+extern void pop_audio_selftest(void);   /* standalone audio test (no graphics) */
 extern int pop_kid_x(void);
 extern int pop_kid_y(void);
 extern int pop_kid_frame(void);
@@ -531,30 +540,51 @@ static char *s_pop_argv[] = { "pop", NULL };
  * before pop_main() fragments the heap. */
 extern void pop_screen_pool_init(void);
 
-static void pop_game_task(void *arg)
-{
+/* Handle of the SDLPoP engine task, so the monitor can read its stack
+ * high-water mark. Declared unconditionally (referenced in app_main). */
+static TaskHandle_t s_pop_game_task = NULL;
+
+static void pop_game_task(void *arg){
     (void)arg;
     g_argc = 1;
     g_argv = s_pop_argv;
+#if POP_AUDIO_SELFTEST
+    ESP_LOGI("pop_port", "[P7] running audio self-test (no graphics)...");
+    pop_audio_selftest();
+    ESP_LOGI("pop_port", "[P7] audio self-test finished; idling");
+    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+#else
     ESP_LOGI("pop_port", "[P1] starting pop_main()...");
     pop_main();                     // normally never returns
     ESP_LOGW("pop_port", "[P1] pop_main() returned unexpectedly");
     vTaskDelete(NULL);
+#endif
 }
 
+#if !POP_AUDIO_SELFTEST
 static void pop_monitor_task(void *arg)
 {
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        /* Report the TRUE byte-addressable (8-bit) DRAM figures: plain
+         * MALLOC_CAP_INTERNAL includes the 64KB pure-IRAM region the game
+         * cannot use for surface data, so it over-reports by ~64KB. Also print
+         * the game task's stack high-water mark (min free bytes ever) so we can
+         * see how much of its stack is really used after the 32KB->20KB trim. */
+        unsigned stack_free = s_pop_game_task
+            ? (unsigned)(uxTaskGetStackHighWaterMark(s_pop_game_task) * sizeof(StackType_t))
+            : 0;
         ESP_LOGI("pop_port",
-                 "[P1] lvl=%d kid(x=%d y=%d frame=%d room=%d alive=%d) heap free=%u largest=%u",
+                 "[P1] lvl=%d kid(x=%d y=%d frame=%d room=%d alive=%d) free8=%u largest8=%u stackmin=%u",
                  pop_current_level(), pop_kid_x(), pop_kid_y(), pop_kid_frame(),
                  pop_kid_room(), pop_kid_alive(),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 stack_free);
     }
 }
+#endif
 
 void app_main(void)
 {
@@ -626,6 +656,11 @@ void app_main(void)
 
     /* Start the SDLPoP engine and a monitor. LCD present is still a no-op in P1;
      * the existing TITLE.DAT viewer is retired now that the engine drives things. */
-    xTaskCreatePinnedToCore(pop_game_task, "pop_game", 32768, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(pop_game_task, "pop_game", 12288, NULL, 5, &s_pop_game_task, 1);
+#if !POP_AUDIO_SELFTEST
+    /* The audio self-test does its own heap logging + integrity checks; skip the
+     * monitor so its periodic largest-free-block walk can't crash on (and mask)
+     * a corruption the self-test is trying to localize. */
     xTaskCreate(pop_monitor_task, "pop_mon", 4096, NULL, 3, NULL);
+#endif
 }
