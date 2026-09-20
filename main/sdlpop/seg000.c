@@ -2264,7 +2264,16 @@ void parse_cmdline_sound() {
 	} else {
 		// Use digi (wave) sounds and MIDI music.
 		sound_flags |= sfDigi;
+#ifndef ESP_PLATFORM
 		sound_flags |= sfMidi;
+#else
+		// This port has no MIDI synth (play_midi_sound() is a no-op stub) and no
+		// filesystem for the OGG music. Leaving sfMidi enabled makes the music
+		// tunes (intro theme, story cutscenes, ending) resolve to the MIDISND
+		// resources, which then play silently. Keeping only sfDigi lets those
+		// tunes fall back to their PC-speaker versions in IBM_SND, which the
+		// square-wave speaker_callback actually renders through the DAC.
+#endif
 		sound_mode = smSblast;
 	}
 }
