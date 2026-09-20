@@ -128,6 +128,12 @@ void hof_read(void);
 void show_hof_text(rect_type* rect,int x_align,int y_align, const char* text);
 int fade_in_1(void);
 int fade_out_1(void);
+#ifdef ESP_PLATFORM
+// ESP32 palette-brightness fade (USE_FADE is off): ramp g_pop_fade_bright between
+// two levels (0=black, 256=full) while re-presenting the current frame.
+extern int g_pop_fade_bright;
+void pop_fade_ramp(int from, int to);
+#endif
 
 // SEG002.C
 void do_init_shad(const byte* source,int seq_index);

@@ -440,16 +440,30 @@ static uint16_t *s_pop_lines[2] = { NULL, NULL };
  * per-frame path allocates nothing. */
 extern unsigned char palette[]; /* rgb_type palette[256], packed r,g,b bytes (0..63) */
 
+/* Global fade level applied when building the palette LUT below. 256 = full
+ * brightness, 0 = black. USE_FADE is off in this port, so instead of the DOS
+ * palette-register fade the engine ramps this value (pop_fade_ramp in seg001.c)
+ * and re-presents the current frame: the whole fade is just a cheap scale on the
+ * 256-entry LUT that is rebuilt every present anyway - no extra buffers, no
+ * re-render. Written and read only from the game task. */
+int g_pop_fade_bright = 256;
+
 void pop_present_indexed(const unsigned char *pix, int w, int h, int pitch)
 {
     if (s_pop_spi == NULL || s_pop_lines[0] == NULL || pix == NULL) return;
 
-    /* Build an index -> RGB565 (byte-swapped for the panel) lookup. */
+    /* Build an index -> RGB565 (byte-swapped for the panel) lookup, scaled by
+     * the current fade brightness. */
+    int bright = g_pop_fade_bright;
+    if (bright < 0) bright = 0; else if (bright > 256) bright = 256;
     uint16_t lut[256];
     for (int i = 0; i < 256; i++) {
-        uint16_t r5 = (uint16_t)((palette[i * 3 + 0] << 2) >> 3);
-        uint16_t g6 = (uint16_t)((palette[i * 3 + 1] << 2) >> 2);
-        uint16_t b5 = (uint16_t)((palette[i * 3 + 2] << 2) >> 3);
+        int pr = (palette[i * 3 + 0] * bright) >> 8;
+        int pg = (palette[i * 3 + 1] * bright) >> 8;
+        int pb = (palette[i * 3 + 2] * bright) >> 8;
+        uint16_t r5 = (uint16_t)((pr << 2) >> 3);
+        uint16_t g6 = (uint16_t)((pg << 2) >> 2);
+        uint16_t b5 = (uint16_t)((pb << 2) >> 3);
         uint16_t v = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
         lut[i] = (uint16_t)((v >> 8) | (v << 8));
     }

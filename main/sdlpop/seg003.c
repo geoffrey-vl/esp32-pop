@@ -218,6 +218,11 @@ void draw_level_first() {
 	if (custom->tbl_level_type[current_level]) {
 		gen_palace_wall_colors();
 	}
+#ifdef ESP_PLATFORM
+	// USE_FADE is off on ESP, so build the level while the screen is black and
+	// then fade it in from black (below), matching the DOS level-start fade.
+	g_pop_fade_bright = 0;
+#endif
 	draw_rect(&screen_rect, color_0_black);
 	show_level();
 	redraw_screen(0);
@@ -234,6 +239,9 @@ void draw_level_first() {
 	// Busy waiting!
 	start_timer(timer_1, 5);
 	do_simple_wait(1);
+#ifdef ESP_PLATFORM
+	pop_fade_ramp(0, 256); // fade the freshly built level in from black
+#endif
 }
 
 // seg003:037B

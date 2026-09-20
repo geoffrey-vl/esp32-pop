@@ -701,16 +701,7 @@ void load_intro(int which_imgs,cutscene_ptr_type func,int free_sounds) {
 	func();
 	is_cutscene = 0;
 	free_all_chtabs_from(3);
-#ifndef ESP_PLATFORM
-	// Desktop: fade_out_1() has already faded the scene to black via the palette;
-	// this just guarantees a clean black screen before the level loads.
-	// On the ESP32 USE_FADE is off, so fade_out_1() is a no-op. Blacking the screen
-	// here makes play_level()'s "while (check_sound_playing()) idle();" wait present
-	// an abrupt ~1s black gap while the cutscene audio tail finishes. Instead keep
-	// the last cutscene frame on screen; draw_level_first() paints the new level
-	// over it once loading is done.
 	draw_rect(&screen_rect, color_0_black);
-#endif
 }
 
 typedef struct star_type {
@@ -837,6 +828,23 @@ void show_hof_text(rect_type* rect,int x_align,int y_align, const char* text) {
 }
 
 // seg001:1029
+#ifdef ESP_PLATFORM
+// ESP32 palette-brightness fade. Ramp the global brightness from->to over a few
+// steps, re-presenting the current onscreen frame each step. idle() runs
+// process_events() + update_screen(), and update_screen() rebuilds the palette
+// LUT (pop_present_indexed) with g_pop_fade_bright applied, so this is a smooth
+// fade of whatever is already on screen with no extra buffers or re-rendering.
+void pop_fade_ramp(int from, int to) {
+	const int steps = 16;
+	for (int i = 1; i <= steps; ++i) {
+		g_pop_fade_bright = from + (to - from) * i / steps;
+		idle();
+		delay_ticks(1);
+	}
+	g_pop_fade_bright = to;
+}
+#endif
+
 int fade_in_1() {
 #ifdef USE_FADE
 //	sbyte index;
@@ -858,7 +866,11 @@ int fade_in_1() {
 #else
 	// stub
 	method_1_blit_rect(onscreen_surface_, offscreen_surface, &screen_rect, &screen_rect, 0);
+#ifdef ESP_PLATFORM
+	pop_fade_ramp(0, 256); // fade the freshly blitted scene up from black
+#else
 	update_screen();
+#endif
 //	SDL_UpdateRect(onscreen_surface_, 0, 0, 0, 0); // debug
 	return 0;
 #endif
@@ -881,6 +893,10 @@ int fade_out_1() {
 	} else {
 		// ...
 	}
+#endif
+#ifdef ESP_PLATFORM
+	pop_fade_ramp(256, 0);   // fade the current frame down to black
+	g_pop_fade_bright = 256; // restore full brightness; the caller blacks the buffer next
 #endif
 	// stub
 	return 0;

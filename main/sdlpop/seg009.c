@@ -4532,6 +4532,24 @@ void reset_clip_rect() {
 // seg009:1983
 void set_bg_attr(int vga_pal_index,int hc_pal_index) {
 	// stub
+#ifdef ESP_PLATFORM
+	// ESP32 flash effect (do_flash, e.g. Jaffar conjuring the hourglass, or a
+	// sword hit). The DOS routine repaints the background - VGA color 0 - with the
+	// flash color while the foreground sprites keep their colors. This port renders
+	// the INDEX8 frame through the global palette[] at present time and the
+	// background is palette index 0, so recolor entry 0 for the flash and restore
+	// it to black (hc_pal_index 0). The SDL colorkey/fill/blit path below is a
+	// no-op on the minimal ESP SDL shim, which is why the flash was invisible.
+	if (!enable_flash) return;
+	if (vga_pal_index != 0) return;
+	if (hc_pal_index == 0) {
+		palette[0].r = palette[0].g = palette[0].b = 0; // restore black background
+	} else {
+		palette[0] = palette[hc_pal_index];             // flash the background
+	}
+	update_screen();
+	return;
+#endif
 #ifdef USE_FLASH
 	//palette[vga_pal_index] = vga_palette[hc_pal_index];
 	if (!enable_flash) return;
