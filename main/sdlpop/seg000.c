@@ -1056,7 +1056,17 @@ void load_sounds(int first,int last) {
 			//printf("overwriting sound_pointers[%d] = %p\n", current, sound_pointers[current]);
 
 
-			sound_pointers[current] = load_sound(current);
+			sound_buffer_type* b = load_sound(current);
+#ifdef ESP_PLATFORM
+			// Only PC-speaker note tables may be cached persistently. Digi sounds
+			// are flash-streamed transient descriptors owned by g_lazy_playing_digi
+			// (freed when the next digi sound plays); caching one here would leave a
+			// dangling pointer in sound_pointers[] that later reads back as garbage
+			// (e.g. spikes flipping from DIGI to a distorted PC-speaker square wave).
+			// Leave it NULL so pop_ensure_sound() reloads it on demand from flash.
+			if (b != NULL && (b->type & 7) != sound_speaker) { free(b); b = NULL; }
+#endif
+			sound_pointers[current] = b;
 		}
 	}
 	if (midi_dat) close_dat(midi_dat);
@@ -1087,7 +1097,17 @@ void load_opt_sounds(int first,int last) {
 		} else*/ {
 			//sound_pointers[current] = (sound_buffer_type*) load_from_opendats_alloc(current + 10000, "bin", NULL, NULL);
 			//printf("overwriting sound_pointers[%d] = %p\n", current, sound_pointers[current]);
-			sound_pointers[current] = load_sound(current);
+			sound_buffer_type* b = load_sound(current);
+#ifdef ESP_PLATFORM
+			// Only PC-speaker note tables may be cached persistently. Digi sounds
+			// are flash-streamed transient descriptors owned by g_lazy_playing_digi
+			// (freed when the next digi sound plays); caching one here would leave a
+			// dangling pointer in sound_pointers[] that later reads back as garbage
+			// (e.g. spikes flipping from DIGI to a distorted PC-speaker square wave).
+			// Leave it NULL so pop_ensure_sound() reloads it on demand from flash.
+			if (b != NULL && (b->type & 7) != sound_speaker) { free(b); b = NULL; }
+#endif
+			sound_pointers[current] = b;
 		}
 	}
 	if (midi_dat) close_dat(midi_dat);
@@ -1645,6 +1665,10 @@ void play_sound(int sound_id) {
 
 // seg000:1304
 void play_next_sound() {
+#ifdef ESP_PLATFORM
+	extern void pop_sound_log_poll(void);
+	pop_sound_log_poll(); // log any sound that ended since the last frame
+#endif
 	if (next_sound >= 0) {
 		if (!check_sound_playing() ||
 			(sound_interruptible[current_sound] != 0 && sound_prio_table[next_sound] <= sound_prio_table[current_sound])

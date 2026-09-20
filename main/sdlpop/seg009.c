@@ -2101,6 +2101,21 @@ static int digi_flash_count = 0;    // source sample count
 static int digi_flash_rate = 11025; // source sample rate
 static int digi_flash_out_pos = 0;  // output frame cursor
 static int digi_flash_out_total = 0;// total output frames (after resample)
+
+// ---- Sound start/stop tracing -------------------------------------------
+// When POP_SOUND_TRACE is set, logs "[SND] start/stop <id> <name>" for every
+// sound so a distorted effect can be identified by ear against the serial log.
+// The id being played is captured when playback starts; natural end is flagged
+// from the audio callbacks (which must not printf) and logged from the game
+// thread via pop_sound_log_poll(). Off by default (pure diagnostic).
+#ifndef POP_SOUND_TRACE
+#define POP_SOUND_TRACE 0
+#endif
+#if POP_SOUND_TRACE
+static int pop_active_sound_id = -1;            // id currently sounding (-1 = none)
+static volatile int pop_sound_end_pending = 0;  // set by audio callback at natural end
+#endif
+static const char* pop_sound_debug_name(int id); // defined below
 #endif
 
 // The properties of the audio device.
@@ -2209,6 +2224,9 @@ void speaker_callback(void *userdata, Uint8 *stream, int len) {
 			speaker_playing = 0;
 			current_speaker_sound = NULL;
 			speaker_note_index = 0;
+#if defined(ESP_PLATFORM) && POP_SOUND_TRACE
+			pop_sound_end_pending = 1; // logged from the game thread
+#endif
 			SDL_Event event;
 			memset(&event, 0, sizeof(event));
 			event.type = SDL_USEREVENT;
@@ -2265,11 +2283,30 @@ void digi_callback(void *userdata, Uint8 *stream, int len) {
 	int out_samples = len / (int) sizeof(short);
 	int i = 0;
 	if (is_sound_on && digi_flash_src != NULL && digi_audiospec != NULL) {
+		const int freq = digi_audiospec->freq;
 		for (; i < out_samples && digi_flash_out_pos < digi_flash_out_total; ++i, ++digi_flash_out_pos) {
-			int src_idx = (int)(((int64_t)digi_flash_out_pos * digi_flash_rate) / digi_audiospec->freq);
-			if (src_idx >= digi_flash_count) src_idx = digi_flash_count - 1;
-			int s = digi_flash_src[src_idx];
-			out[i] = (short)((s | (s << 8)) - 32768);
+			// Map this output frame to a fractional source position and LERP
+			// between the two neighbouring 8-bit flash samples. Nearest-neighbour
+			// resampling stair-steps the waveform, which adds harsh high-frequency
+			// harmonics on sounds whose source rate is far from the device rate
+			// (e.g. the 2750 Hz looping level-door slide is a 4x upsample, and the
+			// 8200 Hz footstep). Linear interpolation matches convert_digi_sound()
+			// on the desktop and removes that buzz.
+			int64_t num = (int64_t)digi_flash_out_pos * digi_flash_rate;
+			int src_idx = (int)(num / freq);
+			int frac = (int)(num - (int64_t)src_idx * freq); // 0..freq-1
+			// Expand unsigned 8-bit flash samples to signed 16-bit (s*257 - 32768).
+			int s0 = digi_flash_src[src_idx < digi_flash_count ? src_idx : digi_flash_count - 1];
+			int v0 = (s0 | (s0 << 8)) - 32768;
+			int v;
+			if (src_idx + 1 < digi_flash_count) {
+				int s1 = digi_flash_src[src_idx + 1];
+				int v1 = (s1 | (s1 << 8)) - 32768;
+				v = v0 + (int)(((int64_t)(v1 - v0) * frac) / freq);
+			} else {
+				v = v0; // no next sample to interpolate toward
+			}
+			out[i] = (short) v;
 		}
 	}
 	// Pad the rest of the chunk with silence (S16 silence == 0).
@@ -2281,6 +2318,9 @@ void digi_callback(void *userdata, Uint8 *stream, int len) {
 		event.type = SDL_USEREVENT;
 		event.user.code = userevent_SOUND;
 		digi_playing = 0;
+#if POP_SOUND_TRACE
+		pop_sound_end_pending = 1; // logged from the game thread
+#endif
 		SDL_PushEvent(&event);
 	}
 	return;
@@ -2571,7 +2611,20 @@ sound_buffer_type* load_sound(int index) {
 		result = pop_load_digi_flash(index);
 		if (result == NULL)
 #endif
-		result = (sound_buffer_type*) load_from_opendats_alloc(index + 10000, "bin", NULL, NULL);
+		{
+			int res_size = 0;
+			result = (sound_buffer_type*) load_from_opendats_alloc(index + 10000, "bin", NULL, &res_size);
+			// POP ships a few unused sound ids (31, 34, 42) as 1-byte speaker
+			// stubs: just the type byte, with no tempo word or notes. Playing one
+			// makes play_speaker_sound/speaker_callback read past this tiny heap
+			// allocation into adjacent memory, emitting garbage square-wave noise
+			// (and a heap over-read). A valid speaker resource needs at least the
+			// type byte + tempo word + one end note, so reject anything smaller.
+			if (result != NULL && (result->type & 7) == sound_speaker && res_size < 6) {
+				free(result);
+				result = NULL;
+			}
+		}
 	}
 	if (result != NULL && (result->type & 7) == sound_digi) {
 		sound_buffer_type* converted = convert_digi_sound(result);
@@ -2664,18 +2717,31 @@ static void pop_free_digi(sound_buffer_type* b) {
 // caller then falls back to the normal in-RAM path for PC-speaker/other types).
 extern void load_from_opendats_metadata(int resource_id, const char* extension, FILE** out_fp, data_location* result, byte* checksum, int* size, dat_type** out_pointer);
 static sound_buffer_type* pop_load_digi_flash(int index) {
-	dat_type* pointer = NULL;
-	data_location loc = data_none;
-	byte checksum = 0;
-	int size = 0;
-	FILE* fp = NULL;
-	load_from_opendats_metadata(index + 10000, "bin", &fp, &loc, &checksum, &size, &pointer);
-	if (loc != data_DAT || pointer == NULL || pointer->flash_res_ptr == NULL || size < 12) {
-		return NULL;
+	int resource_id = index + 10000;
+	// Walk ALL open DAT files and pick the DIGITISED copy of this sound if one
+	// exists anywhere, independent of chain order. load_from_opendats_metadata()
+	// returns the FIRST chain match of any type, so a PC-speaker copy in an
+	// IBM_SND*.DAT can shadow the digi copy in a DIGISND*.DAT (e.g. sound 49
+	// "spikes": speaker in IBM_SND2, digi in DIGISND2), which made the effect
+	// play as a harsh square wave instead of the sample. Preferring the digi
+	// type here mirrors the desktop's Sound Blaster behaviour.
+	sound_buffer_type* flashbuf = NULL;
+	for (dat_type* pointer = dat_chain_ptr; pointer != NULL; pointer = pointer->next_dat) {
+		if (pointer->flash_base == NULL || pointer->dat_table == NULL) continue;
+		dat_table_type* dat_table = pointer->dat_table;
+		int rc = SDL_SwapLE16(dat_table->res_count);
+		for (int i = 0; i < rc; ++i) {
+			if (SDL_SwapLE16(dat_table->entries[i].id) != resource_id) continue;
+			int sz = SDL_SwapLE16(dat_table->entries[i].size);
+			uint32_t off = SDL_SwapLE32(dat_table->entries[i].offset);
+			if (sz < 12 || (size_t)off + (size_t)sz + 1 > pointer->flash_size) break;
+			sound_buffer_type* cand = (sound_buffer_type*)(pointer->flash_base + off + 1);
+			if ((cand->type & 7) == sound_digi) flashbuf = cand;
+			break; // a resource id appears at most once per DAT
+		}
+		if (flashbuf != NULL) break; // found a digitised version
 	}
-	// The resource is a sound_buffer_type as stored in the DAT (read-only flash).
-	sound_buffer_type* flashbuf = (sound_buffer_type*) pointer->flash_res_ptr;
-	if ((flashbuf->type & 7) != sound_digi) return NULL; // not a digitised sound
+	if (flashbuf == NULL) return NULL; // not digitised: caller uses the PC-speaker path
 	waveinfo_type wi;
 	if (!determine_wave_version(flashbuf, &wi)) return NULL;
 	if (wi.sample_count <= 0 || wi.sample_rate <= 0 || wi.samples == NULL) return NULL;
@@ -2725,6 +2791,125 @@ sound_buffer_type* pop_ensure_sound(int id) {
 // and NO game loop. Walks every sound resource id, loads it on demand, logs its
 // type/length + heap state, and plays digi sounds through the real feeder path.
 // Called from pop_game_task instead of pop_main() when POP_AUDIO_SELFTEST=1.
+
+// Human-readable names so the serial log identifies each sound as it plays,
+// making it easy to point out a distorted one by ear. Indexed by sound id.
+static const char* pop_sound_debug_name(int id) {
+	switch (id) {
+	case 0:  return "fell_to_death";
+	case 1:  return "falling";
+	case 2:  return "tile_crashing";
+	case 3:  return "button_pressed";
+	case 4:  return "gate_closing";
+	case 5:  return "gate_opening";
+	case 6:  return "gate_closing_fast";
+	case 7:  return "gate_stop";
+	case 8:  return "bumped";
+	case 9:  return "grab";
+	case 10: return "sword_vs_sword";
+	case 11: return "sword_moving";
+	case 12: return "guard_hurt";
+	case 13: return "kid_hurt";
+	case 14: return "leveldoor_closing";
+	case 15: return "leveldoor_sliding";
+	case 16: return "medium_land";
+	case 17: return "soft_land";
+	case 18: return "drink";
+	case 19: return "draw_sword";
+	case 20: return "loose_shake_1";
+	case 21: return "loose_shake_2";
+	case 22: return "loose_shake_3";
+	case 23: return "footstep";
+	case 24: return "death_regular";
+	case 25: return "presentation";
+	case 26: return "embrace";
+	case 27: return "cutscene_2_4_6_12";
+	case 28: return "death_in_fight";
+	case 29: return "meet_Jaffar";
+	case 30: return "big_potion";
+	case 32: return "shadow_music";
+	case 33: return "small_potion";
+	case 35: return "cutscene_8_9";
+	case 36: return "out_of_time";
+	case 37: return "victory";
+	case 38: return "blink";
+	case 39: return "low_weight";
+	case 40: return "cutscene_12_short_time";
+	case 41: return "end_level_music";
+	case 43: return "victory_Jaffar";
+	case 44: return "skel_alive";
+	case 45: return "jump_through_mirror";
+	case 46: return "chomped";
+	case 47: return "chomper";
+	case 48: return "spiked";
+	case 49: return "spikes";
+	case 50: return "story_2_princess";
+	case 51: return "princess_door_opening";
+	case 52: return "story_4_Jaffar_leaves";
+	case 53: return "story_3_Jaffar_comes";
+	case 54: return "intro_music";
+	case 55: return "story_1_absence";
+	case 56: return "ending_music";
+	default: return "?";
+	}
+}
+
+// Called from the game thread (play_next_sound) each frame: if a sound reached
+// its natural end since the last poll, log the stop. Natural end is detected in
+// the audio callback, which only sets a flag (it must not printf).
+void pop_sound_log_poll(void) {
+#if POP_SOUND_TRACE
+	if (pop_sound_end_pending) {
+		pop_sound_end_pending = 0;
+		int id = pop_active_sound_id;
+		pop_active_sound_id = -1;
+		if (id >= 0) {
+			printf("[SND] stop  %2d %-22s (ended)\n", id, pop_sound_debug_name(id));
+		}
+	}
+#endif
+}
+
+// Play a single sound id and block (with a guard) until it finishes. Shared by
+// the walk-through test and the demo-sounds test so both use the identical
+// feeder path the real game uses. Returns the resolved sound type (or -1).
+static int pop_selftest_play_one(int id, int repeats) {
+	int played_type = -1;
+	for (int r = 0; r < repeats; ++r) {
+		sound_buffer_type* b = load_sound(id);
+		if (b == NULL) {
+			printf(">>> SND %2d %-22s : (no resource)\n", id, pop_sound_debug_name(id));
+			return -1;
+		}
+		int type = b->type & 7;
+		played_type = type;
+		if (type == sound_digi_converted) {
+			pop_digi_stream_type* d = (pop_digi_stream_type*) b;
+			printf(">>> SND %2d %-22s : DIGI  rate=%d count=%d (take %d/%d)\n",
+			       id, pop_sound_debug_name(id), d->rate, d->count, r + 1, repeats);
+			play_sound_from_buffer(b);
+			int guard = 0;
+			while (check_sound_playing() && guard++ < 500) SDL_Delay(10);
+			SDL_Delay(300);
+		} else if (type == sound_speaker) {
+			printf(">>> SND %2d %-22s : SPEAKER (take %d/%d)\n",
+			       id, pop_sound_debug_name(id), r + 1, repeats);
+			play_sound_from_buffer(b);
+			int guard = 0;
+			while (check_sound_playing() && guard++ < 1500) SDL_Delay(10);
+			speaker_sound_stop();
+			pop_free_digi(b);
+			SDL_Delay(300);
+		} else {
+			printf(">>> SND %2d %-22s : type=%d (unsupported, skip)\n",
+			       id, pop_sound_debug_name(id), type);
+			pop_free_digi(b);
+			return type;
+		}
+	}
+	return played_type;
+}
+
 void pop_audio_selftest(void) {
 	printf("\n=== POP AUDIO SELFTEST (no graphics) ===\n");
 
@@ -2745,62 +2930,28 @@ void pop_audio_selftest(void) {
 
 	pop_ensure_sound_dats();
 
-	const int last_id = 57; // POP has ~58 sound ids (0..57)
-	for (int id = 0; id <= last_id; ++id) {
-		sound_buffer_type* b = load_sound(id);
-		if (b == NULL) {
-			printf("selftest: id=%2d -> (none) free=%u largest=%u\n", id,
-			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-			continue;
-		}
-		int type = b->type & 7;
-		if (type == sound_digi_converted) {
-			// Digitized SFX: play through the DAC feeder. Ownership passes to
-			// g_lazy_playing_digi (freed on the next play_digi_sound).
-			printf("selftest: id=%2d digi    len=%d -> PLAY  free=%u largest=%u\n", id,
-			       b->converted.length,
-			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-			play_sound_from_buffer(b);
-			int guard = 0;
-			while (check_sound_playing() && guard++ < 500) { // up to ~5s
-				SDL_Delay(10);
-			}
-			SDL_Delay(250); // brief gap between sounds
-		} else if (type == sound_speaker) {
-			// PC-speaker melody/beep (option 1): synthesized as a square wave by
-			// speaker_callback and mixed into the same DAC output. The intro tune
-			// and other beeper effects arrive here (from the IBM_SND DATs).
-			printf("selftest: id=%2d speaker      -> PLAY  free=%u largest=%u\n", id,
-			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-			       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-			play_sound_from_buffer(b); // -> play_speaker_sound (points into b)
-			int guard = 0;
-			while (check_sound_playing() && guard++ < 1500) { // up to ~15s (tunes)
-				SDL_Delay(10);
-			}
-			// Ensure the feeder no longer references b, then release it (load_sound
-			// returns a fresh buffer each call; not cached here).
-			speaker_sound_stop();
-			pop_free_digi(b);
-			SDL_Delay(250);
-		} else {
-			// MIDI/other: unsupported in this port (no synth). Log and release.
-			printf("selftest: id=%2d type=%d (unsupported, skip) free=%u\n", id, type,
-			       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-			pop_free_digi(b);
-		}
+	// The sounds that actually fire during the attract/demo level (kid running
+	// through rooms 1-2, then a fall + land): footstep, bump, lands, loose tiles,
+	// grab. Loop these first, repeated and clearly labelled, so a distorted one
+	// is easy to point out by ear. Set POP_AUDIO_SELFTEST=1 and watch the log.
+	static const int demo_sounds[] = { 23, 8, 16, 17, 9, 20, 21, 22, 1 };
 
-		// Bisect the heap corruptor: verify integrity right after each sound so
-		// the offending id is caught at its source (before the monitor task's
-		// passive walk trips over it later). Requires heap poisoning enabled.
-		if (!heap_caps_check_integrity_all(true)) {
-			printf("selftest: *** HEAP CORRUPT detected after id=%d ***\n", id);
+	int pass = 0;
+	for (;;) {
+		printf("\n----- DEMO SOUNDS pass %d (footstep, bump, lands, ...) -----\n", ++pass);
+		for (size_t i = 0; i < sizeof(demo_sounds) / sizeof(demo_sounds[0]); ++i) {
+			pop_selftest_play_one(demo_sounds[i], 3);
 		}
+		printf("----- ALL SOUNDS pass %d (0..56) -----\n", pass);
+		for (int id = 0; id <= 56; ++id) {
+			pop_selftest_play_one(id, 1);
+			if (!heap_caps_check_integrity_all(true)) {
+				printf("selftest: *** HEAP CORRUPT after id=%d ***\n", id);
+			}
+		}
+		printf("=== SELFTEST pass %d done; looping in 2s ===\n", pass);
+		SDL_Delay(2000);
 	}
-
-	printf("=== POP AUDIO SELFTEST DONE ===\n\n");
 }
 #endif // ESP_PLATFORM
 
@@ -2923,6 +3074,27 @@ void play_sound_from_buffer(sound_buffer_type* buffer) {
 		//quit(1);
 		return;
 	}
+#if defined(ESP_PLATFORM) && POP_SOUND_TRACE
+	{
+		// If a sound was still active, this new one interrupts it.
+		if (pop_active_sound_id >= 0) {
+			printf("[SND] stop  %2d %-22s (interrupted)\n",
+			       pop_active_sound_id, pop_sound_debug_name(pop_active_sound_id));
+		}
+		const char* type_name = "?";
+		switch (buffer->type & 7) {
+			case sound_speaker:        type_name = "SPEAKER"; break;
+			case sound_digi:           type_name = "DIGI";    break;
+			case sound_digi_converted: type_name = "DIGI";    break;
+			case sound_midi:           type_name = "MIDI";    break;
+			case sound_ogg:            type_name = "OGG";     break;
+			default: break;
+		}
+		pop_active_sound_id = current_sound;
+		printf("[SND] start %2d %-22s (%s)\n",
+		       current_sound, pop_sound_debug_name(current_sound), type_name);
+	}
+#endif
 	switch (buffer->type & 7) {
 		case sound_speaker:
 			play_speaker_sound(buffer);
