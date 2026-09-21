@@ -1414,11 +1414,14 @@ void control_kid() {
 		control();
 		// The player can start a new game or load a saved game during the demo.
 		word key = key_test_quit();
+#ifndef ESP_PLATFORM
 		if (key == (SDL_SCANCODE_L | WITH_CTRL)) { // Ctrl+L
 			if (load_game()) {
 				start_game();
 			}
-		} else {
+		} else
+#endif // ESP_PLATFORM
+		{
 			if (key) {
 				start_level = custom->first_level; // 1
 				start_game();

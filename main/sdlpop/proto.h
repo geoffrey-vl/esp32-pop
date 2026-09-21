@@ -61,8 +61,10 @@ void transition_ltr(void);
 void release_title_images(void);
 void draw_full_image(enum full_image_id id);
 void load_kid_sprite(void);
+#ifndef ESP_PLATFORM
 void save_game(void);
 short load_game(void);
+#endif // ESP_PLATFORM
 void clear_screen_and_sounds(void);
 void parse_cmdline_sound(void);
 void free_optional_sounds(void);

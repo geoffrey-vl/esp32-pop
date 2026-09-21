@@ -565,11 +565,15 @@ int process_key() {
 				start_recording();
 			} else
 			#endif
+			#ifndef ESP_PLATFORM
 			if (key == (SDL_SCANCODE_L | WITH_CTRL)) { // Ctrl+L
 				if (!load_game()) return 0;
 			} else {
 				start_level = custom->first_level; // 1
 			}
+			#else
+			start_level = custom->first_level; // 1
+			#endif
 			draw_rect(&screen_rect, color_0_black);
 #ifdef USE_FADE
 			if (is_global_fading) {
@@ -624,6 +628,7 @@ int process_key() {
 				is_restart_level = 1;
 			}
 		break;
+		#ifndef ESP_PLATFORM
 		case SDL_SCANCODE_G | WITH_CTRL: // Ctrl+G
 			// CusPoP: first and last level where saving is allowed
 //			if (current_level > 2 && current_level < 14) { // original
@@ -631,6 +636,7 @@ int process_key() {
 				save_game();
 			}
 		break;
+		#endif // ESP_PLATFORM
 		case SDL_SCANCODE_J | WITH_CTRL: // Ctrl+J
 			if ((sound_flags & sfDigi) && sound_mode == smTandy) {
 				answer_text = "JOYSTICK UNAVAILABLE";
@@ -2182,6 +2188,7 @@ void load_kid_sprite() {
 	load_chtab_from_file(id_chtab_2_kid, 400, "KID.DAT", 1<<7);
 }
 
+#ifndef ESP_PLATFORM
 const char* save_file = "PRINCE.SAV";
 
 const char* get_save_path(char* custom_path_buffer, size_t max_len) {
@@ -2253,6 +2260,7 @@ short load_game() {
 	}
 	return success;
 }
+#endif // ESP_PLATFORM
 
 // seg000:1F02
 void clear_screen_and_sounds() {
