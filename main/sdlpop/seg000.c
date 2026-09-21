@@ -2330,10 +2330,12 @@ void free_all_sounds() {
 
 void load_all_sounds() {
 #ifdef ESP_PLATFORM
-	// Audio is deferred to the optional final phase of the ESP32 port. Skip all
-	// sound loading: it needs ~58 buffers plus per-sound conversion allocations
-	// this hardware can't spare, and with no audio backend convert_digi_sound()
-	// dereferences a NULL digi_audiospec. Silent gameplay is intended for now.
+	// The ESP32 port loads sounds lazily, so there is nothing to bulk-load here.
+	// play_sound() routes through pop_ensure_sound(), which loads the requested
+	// sound on demand: PC-speaker note tables are cached in sound_pointers[],
+	// while digitised SFX stay in flash and are expanded/resampled on the fly in
+	// digi_callback (see seg009.c). Pre-loading all 58 buffers up front would
+	// only waste the scarce 8-bit heap without any benefit.
 	return;
 #endif
 	if (!use_custom_levelset || always_use_original_music) {

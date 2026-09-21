@@ -73,6 +73,14 @@ The authors of this program may be contacted at https://forum.princed.org
 
 #endif
 
+#ifdef ESP_PLATFORM
+// The ESP32 port has no filesystem for replay files and no title-screen menu to
+// record/play them, so the recording/replay feature is compiled out. (It is
+// already off while USE_QUICKSAVE is disabled; the explicit #undef keeps it off
+// even if quicksave gets enabled for a desktop build sharing this header.)
+#undef USE_REPLAY
+#endif
+
 // Adds a way to crouch immediately after climbing up: press down and forward simultaneously.
 // In the original game, this could not be done (pressing down always causes the kid to climb down).
 #define ALLOW_CROUCH_AFTER_CLIMBING
