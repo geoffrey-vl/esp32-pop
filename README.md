@@ -142,10 +142,6 @@ At the meantime a *Prince of Persia* title image (resource 51 from
 `TITLE.DAT`) will be displayed in the top-left of the connected LCD screen,
 with the rest of the screen left black.
 
-## Troubleshooting
-
-For any technical queries, please open an [issue] (https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
-
 ## License
 
 This project is distributed under the **GNU General Public License, version 2**
